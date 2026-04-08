@@ -11,7 +11,7 @@
  * limitations under the License.
  *
  * Author: Nitin Rajput (coRAN LABS)
- *
+ * Updated: Micky Kumar
  * eBPF GTP-U Encapsulation Program - TC version
  * Adds GTP headers to outgoing packets for UE traffic
  */
@@ -232,9 +232,12 @@ int gtp_encap_handler(struct __sk_buff *skb) {
         return TC_ACT_SHOT;  // Drop inactive sessions
     }
     
-    __u32 packet_len = skb->len;  // Use skb->len instead of pointer arithmetic
+    
+    // Phase-1 Fix (Finding 4): Count only UE payload bytes for DL stats
+    __u64 payload_len = skb->len;
     session_info->dl_packets++;
-    session_info->dl_bytes += packet_len;
+    session_info->dl_bytes += payload_len;
+
     session_info->last_seen = bpf_ktime_get_ns();
     
     // Apply QoS marking if configured
@@ -251,6 +254,12 @@ int gtp_encap_handler(struct __sk_buff *skb) {
     __u32 gtp_ext_len = 8;
     outer_hdr_len += gtp_ext_len;
 
+    // Phase-1 Fix (Finding 3): Guard against invalid headroom before encapsulation
+    if (skb->len + outer_hdr_len <= skb->len) {
+        update_stats(STATS_ADJUST_HEAD_FAIL, 1);
+        update_stats(STATS_DL_ERRORS, 1);
+        return TC_ACT_SHOT;
+    }
     int ret = bpf_skb_adjust_room(skb, outer_hdr_len, BPF_ADJ_ROOM_MAC, 0);
     if (ret < 0) {
         update_stats(STATS_ADJUST_HEAD_FAIL, 1);
@@ -315,11 +324,9 @@ int gtp_encap_handler(struct __sk_buff *skb) {
     __u16 gtp_payload_len = gtp_ext_len + inner_len; // Extension + inner packet
     headers[44] = (gtp_payload_len >> 8) & 0xFF; // length
     headers[45] = gtp_payload_len & 0xFF;
-    __u32 teid = session_info->teid_dl_out;
-    headers[46] = (teid >> 24) & 0xFF; // TEID
-    headers[47] = (teid >> 16) & 0xFF;
-    headers[48] = (teid >> 8) & 0xFF;
-    headers[49] = teid & 0xFF;
+    // Phase-1 Fix (Finding 2): Write TEID in network byte order
+    __be32 teid = session_info->teid_dl_out;
+    __builtin_memcpy(&headers[46], &teid, sizeof(teid));
 
     headers[50] = 0x00; headers[51] = 0x00; // Sequence number (not used)
     headers[52] = 0x00; // N-PDU number (not used)

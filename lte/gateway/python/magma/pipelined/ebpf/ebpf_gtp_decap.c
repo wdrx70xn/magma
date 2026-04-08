@@ -11,7 +11,7 @@
  * limitations under the License.
  *
  * Author: Nitin Rajput (coRAN LABS)
- *
+ *Updated: Micky Kumar
  * eBPF GTP-U Decapsulation Program - TC eBPF Implementation
  * Handles GTP decapsulation in TC ingress context
  */
@@ -276,7 +276,12 @@ int gtp_decap_handler(struct __sk_buff* skb) {
     __u16 udp_src_port = (__u16)udp_data[0] << 8 | (__u16)udp_data[1];
     __u16 udp_dest_port= (__u16)udp_data[2] << 8 | (__u16)udp_data[3];
     bpf_trace_printk("[UDP] Src:%u Dst:%u\n", udp_src_port, udp_dest_port);
-
+    // Phase‑1 Fix (Finding 1): Validate UDP length against minimum GTP header size
+    __u16 udp_len = (__u16)udp_data[4] << 8 | udp_data[5];
+    if (udp_len < sizeof(struct udphdr) + GTP_HDR_SIZE_MIN) {
+        update_stats(STATS_INVALID_GTP, 1);
+        return TC_ACT_SHOT;
+}
     if (udp_dest_port != 2152) {
         bpf_trace_printk("[GTP] Not GTP-U (udp dst != 2152)\n");
         return TC_ACT_OK;  
@@ -298,9 +303,9 @@ int gtp_decap_handler(struct __sk_buff* skb) {
 
     __u8 gtp_flags = gtp_data[0];
     __u8 gtp_type  = gtp_data[1];
-    __u32 gtp_teid = (__u32)gtp_data[4] << 24 | (__u32)gtp_data[5] << 16 |
-                     (__u32)gtp_data[6] << 8  | (__u32)gtp_data[7];
-    __u8 gtp_version = (gtp_flags & GTP_FLAG_VERSION_MASK) >> 5;
+// Phase-1 Fix (Finding 2): Parse TEID in network byte order to avoid endianness mismatch
+__be32 gtp_teid = *(__be32 *)&gtp_data[4];
+__u8 gtp_version = (gtp_flags & GTP_FLAG_VERSION_MASK) >> 5;
 
     bpf_trace_printk("[GTP] Flags: 0x%x Ver:%u Type:%u\n", gtp_flags, gtp_version, gtp_type);
     bpf_trace_printk("[GTP] TEID: %u\n", gtp_teid);
@@ -477,8 +482,10 @@ int gtp_decap_handler(struct __sk_buff* skb) {
         return TC_ACT_SHOT;
     }
     
+    // Phase‑1 Fix (Finding 4): Count only UE payload bytes
+    __u64 payload_len = skb->len - ETH_HLEN;
     session_info->ul_packets++;
-    session_info->ul_bytes += skb->len;
+    session_info->ul_bytes += payload_len;
     session_info->last_seen = bpf_ktime_get_ns();
     
     __u32 ue_ip_int = ((__u32)inner_ip_data[12] << 24) |
@@ -488,12 +495,20 @@ int gtp_decap_handler(struct __sk_buff* skb) {
 
     __u32 calculated_mark = compute_ue_mark(ue_ip_int);
 
-    session_info->metadata_mark = calculated_mark;
+    // Phase‑1 Fix (Finding 6): Store metadata mark in network byte order
+    session_info->metadata_mark = bpf_htonl(calculated_mark);
     skb->mark = calculated_mark;
 
     bpf_trace_printk("[GTP] Calculated UE mark: 0x%x for UE IP 0x%x\n",
                      calculated_mark, ue_ip_int);
 
+    
+    // Phase‑1 Fix (Finding 3): Guard against invalid head removal
+    if (skb->len <= outer_hdr_len) {
+        update_stats(STATS_ADJUST_HEAD_FAIL, 1);
+        update_stats(STATS_UL_ERRORS, 1);
+        return TC_ACT_SHOT;
+    }
     __s32 adjust_len = -(__s32)outer_hdr_len;
     int ret = bpf_skb_adjust_room(skb, adjust_len, BPF_ADJ_ROOM_MAC, 0);
     if (ret < 0) {
@@ -638,7 +653,9 @@ int gtp_veth0_mark_handler(struct __sk_buff* skb) {
                       ((__u32)pkt_data[ETH_HLEN + 14] << 8) |
                       (__u32)pkt_data[ETH_HLEN + 15];
 
-    __u32 restored_mark = compute_ue_mark(ue_ip_int);
+    // Phase‑1 Fix (Finding 6): Restore metadata mark from network byte order
+    __u32 restored_mark = bpf_ntohl(session_info->metadata_mark);
+    skb->mark = restored_mark;
 
     session_info->metadata_mark = restored_mark;
     skb->mark = restored_mark;

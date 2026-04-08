@@ -60,8 +60,9 @@ class BPFMapWrapper:
         if hasattr(value, 'enb_ip'):
             import struct
             struct.pack_into('<I', value_bytes, 0, value.enb_ip)
-            struct.pack_into('<I', value_bytes, 4, value.teid_ul_in)
-            struct.pack_into('<I', value_bytes, 8, value.teid_ul_out)
+            # Phase‑1 Fix (Finding 2): Store TEIDs in network byte order
+struct.pack_into('!I', value_bytes, 4, value.teid_ul_in)
+struct.pack_into('!I', value_bytes, 8, value.teid_ul_out)
             struct.pack_into('<I', value_bytes, 12, value.teid_dl_in)
             struct.pack_into('<I', value_bytes, 16, value.teid_dl_out)
             struct.pack_into('<I', value_bytes, 20, value.s1u_ifindex)
@@ -1422,940 +1423,955 @@ class EbpfGtpManager:
             
         except Exception as e:
             LOG.error(f"Failed to pin maps: {e}")
-    
-    def _save_sessions_to_file(self):
-        """Save current sessions to file for recovery after restart"""
-        try:
-            session_file = os.path.join(EBPF_GTP_DIR, "saved_sessions.json")
-            sessions = []
             
-            for key in self.ue_session_map.keys():
-                value = self.ue_session_map[key]
-                if value:
+        def _save_sessions_to_file(self):
+            """Save current sessions to file for recovery after restart"""
+            try:
+                session_file = os.path.join(EBPF_GTP_DIR, "saved_sessions.json")
+                sessions = []
+
+                # Phase‑1 Fix: ExternalBPFMap may not support iteration
+                if not hasattr(self.ue_session_map, 'items'):
+                    LOG.warning("Session save skipped: map iteration not supported")
+                    return
+
+                for key, value in self.ue_session_map.items():
+                    if not value:
+                        continue
+
                     session_info = self._parse_session_value_ctypes(value)
+                    if not session_info:
+                        continue
+
+                    # Phase‑1 Fix: derive UE IP string from map key (network byte order)
+                    ue_ip_str = socket.inet_ntoa(
+                        struct.pack("!I", key.ue_ip if hasattr(key, 'ue_ip') else key)
+                    )
+
                     sessions.append({
-                        "ue_ip_str": session_info['ue_ip_str'],
+                        "ue_ip_str": ue_ip_str,
                         "session_info": session_info
                     })
+
+                import json
+                with open(session_file, 'w') as f:
+                    json.dump(sessions, f, indent=2)
+
+                LOG.info("Saved %d sessions to %s", len(sessions), session_file)
+
+            except Exception as e:
+                LOG.warning("Failed to save sessions to file: %s", e)
+
             
-            import json
-            with open(session_file, 'w') as f:
-                json.dump(sessions, f, indent=2)
-            
-            LOG.info(f"Saved {len(sessions)} sessions to {session_file}")
-            
-        except Exception as e:
-            LOG.warning(f"Failed to save sessions to file: {e}")
-    
-    def _restore_sessions_from_file(self):
-        """Restore sessions from file after restart"""
-        try:
-            session_file = os.path.join(EBPF_GTP_DIR, "saved_sessions.json")
-            if not os.path.exists(session_file):
-                return
-            
-            import json
-            with open(session_file, 'r') as f:
-                sessions = json.load(f)
-            
-            restored = 0
-            for session in sessions:
+            def _restore_sessions_from_file(self):
+                """Restore sessions from file after restart"""
                 try:
-                    info = session['session_info']
-                    self.add_ue_session(
-                        ue_ip_str=info['ue_ip_str'],
-                        enb_ip_int=info['enb_ip_int'],
-                        ue_teid=info['ue_teid'],
-                        enb_teid=info['enb_teid'],
-                        bearer_id=info.get('bearer_id', 0)
-                    )
-                    restored += 1
+                    session_file = os.path.join(EBPF_GTP_DIR, "saved_sessions.json")
+                    if not os.path.exists(session_file):
+                        return
+                    
+                    import json
+                    with open(session_file, 'r') as f:
+                        sessions = json.load(f)
+                    
+                    restored = 0
+                    for session in sessions:
+                        try:
+                            info = session['session_info']
+                            self.add_ue_session(
+                                ue_ip_str=info['ue_ip_str'],
+                                enb_ip_int=info['enb_ip_int'],
+                                ue_teid=info['ue_teid'],
+                                enb_teid=info['enb_teid'],
+                                bearer_id=info.get('bearer_id', 0)
+                            )
+                            restored += 1
+                        except Exception as e:
+                            LOG.warning(f"Failed to restore session: {e}")
+                    
+                    LOG.info(f"Restored {restored} sessions from file")
+                    
+                    # Remove file after successful restoration
+                    os.remove(session_file)
+                    
                 except Exception as e:
-                    LOG.warning(f"Failed to restore session: {e}")
-            
-            LOG.info(f"Restored {restored} sessions from file")
-            
-            # Remove file after successful restoration
-            os.remove(session_file)
-            
-        except Exception as e:
-            LOG.warning(f"Failed to restore sessions from file: {e}")
+                    LOG.warning(f"Failed to restore sessions from file: {e}")
 
-    def _attach_programs(self) -> bool:
-        """
-        Attach eBPF programs using TC+TC approach with flower filter
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            LOG.info("Attaching eBPF programs using TC+TC approach...")
-            
-            # Get interface indices
-            s1u_ifindex = self._get_ifindex(self.s1u_iface)
-            if not s1u_ifindex:
-                LOG.error("Failed to get interface index for %s", self.s1u_iface)
-                return False
+            def _attach_programs(self) -> bool:
+                """
+                Attach eBPF programs using TC+TC approach with flower filter
                 
-            ebpf_ifindex = self._get_ifindex(GTP_VETH_EBPF)
-            if not ebpf_ifindex:
-                LOG.error("Failed to get interface index for %s", GTP_VETH_EBPF)
-                return False
-            
-            # Only clean up filters if we're NOT reusing existing TC programs
-            if not (hasattr(self, '_tc_map_ids') and self._tc_map_ids):
-                # Clean up ALL existing filters on interfaces to ensure fresh start
+                Returns:
+                    True if successful, False otherwise
+                """
                 try:
-                    # Clean all filters on s1u interface
-                    subprocess.run(['tc', 'filter', 'del', 'dev', self.s1u_iface, 'ingress'],
-                                  capture_output=True, check=False, timeout=2)
-                    # Clean all filters on veth interfaces
-                    subprocess.run(['tc', 'filter', 'del', 'dev', GTP_VETH_EBPF, 'ingress'],
-                                  capture_output=True, check=False, timeout=2)
-                    subprocess.run(['tc', 'filter', 'del', 'dev', GTP_VETH_EBPF, 'egress'],
-                                  capture_output=True, check=False, timeout=2)
-                    subprocess.run(['tc', 'filter', 'del', 'dev', GTP_VETH_OVS, 'ingress'],
-                                  capture_output=True, check=False, timeout=2)
-                    LOG.debug("Cleaned up any existing filters on all interfaces")
-                except:
-                    pass
-            else:
-                LOG.debug("Keeping existing TC filters since we're reusing programs")
-            
-            # Step 1: Setup flower filter on s1u_iface (eth0) to redirect GTP traffic
-            LOG.info("Setting up flower filter on %s to redirect GTP traffic to %s", 
-                     self.s1u_iface, GTP_VETH_EBPF)
-            self._setup_flower_redirect(self.s1u_iface, s1u_ifindex, ebpf_ifindex)
-            
-            # Step 2: Setup clsact qdisc on gtp_veth1
-            try:
-                self.ipr.tc("add", "clsact", ebpf_ifindex)
-                LOG.debug("Added clsact qdisc to %s", GTP_VETH_EBPF)
-            except NetlinkError as e:
-                if "File exists" in str(e):
-                    LOG.debug("clsact qdisc already exists on %s", GTP_VETH_EBPF)
-                else:
+                    LOG.info("Attaching eBPF programs using TC+TC approach...")
+                    
+                    # Get interface indices
+                    s1u_ifindex = self._get_ifindex(self.s1u_iface)
+                    if not s1u_ifindex:
+                        LOG.error("Failed to get interface index for %s", self.s1u_iface)
+                        return False
+                        
+                    ebpf_ifindex = self._get_ifindex(GTP_VETH_EBPF)
+                    if not ebpf_ifindex:
+                        LOG.error("Failed to get interface index for %s", GTP_VETH_EBPF)
+                        return False
+                    
+                    # Only clean up filters if we're NOT reusing existing TC programs
+                    if not (hasattr(self, '_tc_map_ids') and self._tc_map_ids):
+                        # Clean up ALL existing filters on interfaces to ensure fresh start
+                        try:
+                            # Clean all filters on s1u interface
+                            subprocess.run(['tc', 'filter', 'del', 'dev', self.s1u_iface, 'ingress'],
+                                        capture_output=True, check=False, timeout=2)
+                            # Clean all filters on veth interfaces
+                            subprocess.run(['tc', 'filter', 'del', 'dev', GTP_VETH_EBPF, 'ingress'],
+                                        capture_output=True, check=False, timeout=2)
+                            subprocess.run(['tc', 'filter', 'del', 'dev', GTP_VETH_EBPF, 'egress'],
+                                        capture_output=True, check=False, timeout=2)
+                            subprocess.run(['tc', 'filter', 'del', 'dev', GTP_VETH_OVS, 'ingress'],
+                                        capture_output=True, check=False, timeout=2)
+                            LOG.debug("Cleaned up any existing filters on all interfaces")
+                        except:
+                            pass
+                    else:
+                        LOG.debug("Keeping existing TC filters since we're reusing programs")
+                    
+                    # Step 1: Setup flower filter on s1u_iface (eth0) to redirect GTP traffic
+                    LOG.info("Setting up flower filter on %s to redirect GTP traffic to %s", 
+                            self.s1u_iface, GTP_VETH_EBPF)
+                    self._setup_flower_redirect(self.s1u_iface, s1u_ifindex, ebpf_ifindex)
+                    
+                    # Step 2: Setup clsact qdisc on gtp_veth1
+                    try:
+                        self.ipr.tc("add", "clsact", ebpf_ifindex)
+                        LOG.debug("Added clsact qdisc to %s", GTP_VETH_EBPF)
+                    except NetlinkError as e:
+                        if "File exists" in str(e):
+                            LOG.debug("clsact qdisc already exists on %s", GTP_VETH_EBPF)
+                        else:
+                            raise
+                    
+
+                    LOG.info("switched the interaces: ha 1")
+                    # Step 3: Attach TC ingress for decap (uplink GTP traffic)
+                    # Skip if we're reusing existing TC programs
+                    if hasattr(self, '_tc_map_ids') and self._tc_map_ids:
+                        LOG.info("Skipping TC attachment - reusing existing programs with maps %s", self._tc_map_ids)
+                        return True
+
+                    LOG.info("Attaching GTP decapsulation to %s ingress", GTP_VETH_EBPF)
+                    self._attach_tc_program(
+                        interface=GTP_VETH_EBPF,
+                        ifindex=ebpf_ifindex,
+                        bpf_prog=self.decap_bpf,
+                        func_name="gtp_decap_handler",
+                        direction="ingress"   # testing purpose ingress-> egress
+                    )
+
+                    # Step 4: Attach gtp_veth0 mark restoration program
+                    ovs_ifindex = self._get_ifindex(GTP_VETH_OVS)
+                    if not ovs_ifindex:
+                        LOG.error("Failed to get interface index for %s", GTP_VETH_OVS)
+                        return False
+
+                    LOG.info("Attaching mark restoration to %s ingress", GTP_VETH_OVS)
+                    self._attach_tc_program(
+                        interface=GTP_VETH_OVS,
+                        ifindex=ovs_ifindex,
+                        bpf_prog=self.veth0_mark_bpf,
+                        func_name="gtp_veth0_mark_handler",
+                        direction="ingress"
+                    )
+
+                    # Step 5: Attach GTP encapsulation to gtp_veth0 egress for downlink
+                    LOG.info("Attaching GTP encapsulation to %s egress", GTP_VETH_OVS)
+                    self._attach_tc_program(
+                        interface=GTP_VETH_OVS,
+                        ifindex=ovs_ifindex,
+                        bpf_prog=self.encap_bpf,
+                        func_name="gtp_encap_handler",
+                        direction="egress"
+                    )
+
+                    LOG.info("Successfully attached TC+TC programs with mark restoration and downlink encap")
+                    LOG.info("Uplink: %s --flower--> %s(ingress/decap) --> %s(ingress/mark) --> OVS",
+                            self.s1u_iface, GTP_VETH_EBPF, GTP_VETH_OVS)
+                    LOG.info("Downlink: OVS --> %s(egress/encap) --> Physical NIC --> RAN",
+                            GTP_VETH_OVS)
+
+                    # NOTE: Map sharing is automatic because all programs (decap, encap, veth0_mark)
+                    # are loaded from the same combined_bpf object via load_func().
+                    # They share the same map instances by design in BCC.
+                    LOG.info("BPF maps are shared across all programs via combined_bpf object")
+
+                    return True
+                    
+                except Exception as e:
+                    LOG.error("Failed to attach eBPF programs: %s", e)
+                    import traceback
+                    LOG.error("Traceback: %s", traceback.format_exc())
+                    return False
+
+            def _attach_tc_program(self, interface: str, ifindex: int, bpf_prog: BPF,
+                                func_name: str, direction: str):
+                """
+                Attach eBPF program to interface via TC
+
+                Args:
+                    interface: Interface name
+                    ifindex: Interface index
+                    bpf_prog: BPF program object
+                    func_name: Function name to attach
+                    direction: "ingress" or "egress"
+                """
+                try:
+                    # Add clsact qdisc
+                    try:
+                        self.ipr.tc("add", "clsact", ifindex)
+                        LOG.debug("Added clsact qdisc to %s", interface)
+                    except NetlinkError as e:
+                        # Already exists, which is fine
+                        LOG.debug("clsact qdisc already exists on %s: %s", interface, e)
+                        pass
+
+                    # Attach BPF program
+                    parent = "ffff:fff2" if direction == "ingress" else "ffff:fff3"
+
+                    LOG.debug("Loading function %s from BPF program", func_name)
+                    fn = bpf_prog.load_func(func_name, BPF.SCHED_CLS)
+
+                    # CRITICAL FIX: Mark handler on gtp_veth0 must NOT use direct_action
+                    # With direct_action=True, TC_ACT_OK stops packet processing
+                    # We need packets to continue to OVS after mark restoration
+                    use_direct_action = True
+                    if interface == GTP_VETH_OVS and func_name == "gtp_veth0_mark_handler":
+                        LOG.info("Mark handler on %s: Disabling direct_action to allow packets to reach OVS", interface)
+                        use_direct_action = False
+
+                    LOG.debug("Attaching BPF filter to %s %s (fd=%d, direct_action=%s)",
+                            interface, direction, fn.fd, use_direct_action)
+                    self.ipr.tc("add-filter", "bpf", ifindex, ":1",
+                            fd=fn.fd, name=fn.name, parent=parent,
+                            classid=1, direct_action=use_direct_action)
+                    
+                    LOG.info("Successfully attached %s to %s %s", func_name, interface, direction)
+                    
+                except Exception as e:
+                    LOG.error("Failed to attach %s to %s %s: %s", func_name, interface, direction, e)
                     raise
-            
 
-            LOG.info("switched the interaces: ha 1")
-            # Step 3: Attach TC ingress for decap (uplink GTP traffic)
-            # Skip if we're reusing existing TC programs
-            if hasattr(self, '_tc_map_ids') and self._tc_map_ids:
-                LOG.info("Skipping TC attachment - reusing existing programs with maps %s", self._tc_map_ids)
-                return True
+            def _setup_flower_redirect(self, interface: str, ifindex: int, target_ifindex: int):
+                """
+                Setup flower filter to redirect GTP traffic to gtp_veth1
+                Using tc command directly for better compatibility
+                Now with separate filters for data and control plane (CRITICAL for kernel module replacement)
+                """
+                try:
+                    # Ensure clsact qdisc exists on source interface
+                    try:
+                        subprocess.run([
+                            'tc', 'qdisc', 'add', 'dev', interface, 'clsact'
+                        ], capture_output=True, check=False)
+                    except:
+                        pass  # OK if already exists
+                    
+                    # Remove any existing flower filters
+                    for prio in ['1', '2']:
+                        try:
+                            subprocess.run([
+                                'tc', 'filter', 'del', 'dev', interface, 
+                                'ingress', 'pref', prio
+                            ], capture_output=True, check=False)
+                        except:
+                            pass  # OK if doesn't exist
+                    
+                    # Filter 1: GTP-U data traffic (T-PDU, type 255)
+                    cmd_data = [
+                        'tc', 'filter', 'add', 'dev', interface,
+                        'ingress', 'prio', '1', 'protocol', 'ip',
+                        'flower',
+                        'ip_proto', 'udp',
+                        'dst_port', '2152',
+                        'action', 'mirred', 'ingress', 'redirect', 'dev', GTP_VETH_EBPF
+                    ]
+                    
+                    result = subprocess.run(cmd_data, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        LOG.error("Failed to add data plane filter: %s", result.stderr)
+                        raise Exception(f"Data plane tc command failed: {result.stderr}")
+                    
+                    # Filter 2: GTP-C control traffic (echo, handover, etc.)
+                    # This ensures control plane packets also reach our eBPF handler
+                    cmd_control = [
+                        'tc', 'filter', 'add', 'dev', interface,
+                        'ingress', 'prio', '2', 'protocol', 'ip', 
+                        'flower',
+                        'ip_proto', 'udp',
+                        'dst_port', '2123',  # GTP-C port
+                        'action', 'mirred', 'ingress', 'redirect', 'dev', GTP_VETH_EBPF
+                    ]
+                    
+                    # Note: GTP-C on 2123 is optional, most control is on 2152
+                    subprocess.run(cmd_control, capture_output=True, text=True)
+                    
+                    LOG.info("Flower filters successfully added on %s to redirect GTP to %s", 
+                            interface, GTP_VETH_EBPF)
+                    LOG.info("Data plane (2152) and Control plane (2123) filters active")
+                    
+                except Exception as e:
+                    LOG.error("Failed to setup flower filter: %s", e)
+                    raise
 
-            LOG.info("Attaching GTP decapsulation to %s ingress", GTP_VETH_EBPF)
-            self._attach_tc_program(
-                interface=GTP_VETH_EBPF,
-                ifindex=ebpf_ifindex,
-                bpf_prog=self.decap_bpf,
-                func_name="gtp_decap_handler",
-                direction="ingress"   # testing purpose ingress-> egress
-            )
-
-            # Step 4: Attach gtp_veth0 mark restoration program
-            ovs_ifindex = self._get_ifindex(GTP_VETH_OVS)
-            if not ovs_ifindex:
-                LOG.error("Failed to get interface index for %s", GTP_VETH_OVS)
-                return False
-
-            LOG.info("Attaching mark restoration to %s ingress", GTP_VETH_OVS)
-            self._attach_tc_program(
-                interface=GTP_VETH_OVS,
-                ifindex=ovs_ifindex,
-                bpf_prog=self.veth0_mark_bpf,
-                func_name="gtp_veth0_mark_handler",
-                direction="ingress"
-            )
-
-            # Step 5: Attach GTP encapsulation to gtp_veth0 egress for downlink
-            LOG.info("Attaching GTP encapsulation to %s egress", GTP_VETH_OVS)
-            self._attach_tc_program(
-                interface=GTP_VETH_OVS,
-                ifindex=ovs_ifindex,
-                bpf_prog=self.encap_bpf,
-                func_name="gtp_encap_handler",
-                direction="egress"
-            )
-
-            LOG.info("Successfully attached TC+TC programs with mark restoration and downlink encap")
-            LOG.info("Uplink: %s --flower--> %s(ingress/decap) --> %s(ingress/mark) --> OVS",
-                     self.s1u_iface, GTP_VETH_EBPF, GTP_VETH_OVS)
-            LOG.info("Downlink: OVS --> %s(egress/encap) --> Physical NIC --> RAN",
-                     GTP_VETH_OVS)
-
-            # NOTE: Map sharing is automatic because all programs (decap, encap, veth0_mark)
-            # are loaded from the same combined_bpf object via load_func().
-            # They share the same map instances by design in BCC.
-            LOG.info("BPF maps are shared across all programs via combined_bpf object")
-
-            return True
-            
-        except Exception as e:
-            LOG.error("Failed to attach eBPF programs: %s", e)
-            import traceback
-            LOG.error("Traceback: %s", traceback.format_exc())
-            return False
-
-    def _attach_tc_program(self, interface: str, ifindex: int, bpf_prog: BPF,
-                          func_name: str, direction: str):
-        """
-        Attach eBPF program to interface via TC
-
-        Args:
-            interface: Interface name
-            ifindex: Interface index
-            bpf_prog: BPF program object
-            func_name: Function name to attach
-            direction: "ingress" or "egress"
-        """
-        try:
-            # Add clsact qdisc
-            try:
-                self.ipr.tc("add", "clsact", ifindex)
-                LOG.debug("Added clsact qdisc to %s", interface)
-            except NetlinkError as e:
-                # Already exists, which is fine
-                LOG.debug("clsact qdisc already exists on %s: %s", interface, e)
+            def _attach_xdp_program(self, interface: str, ifindex: int, bpf_prog: BPF, func_name: str):
+                """
+                Attach eBPF program to interface via XDP
+                
+                Args:
+                    interface: Interface name
+                    ifindex: Interface index
+                    bpf_prog: BPF program object
+                    func_name: Function name to attach
+                """
+                # XDP attachment code commented out - using TC eBPF
+                # try:
+                #     LOG.debug("Loading XDP function %s from BPF program", func_name)
+                #     fn = bpf_prog.load_func(func_name, BPF.XDP)
+                #     
+                #     LOG.debug("Attaching XDP program to %s (fd=%d)", interface, fn.fd)
+                #     # Attach XDP program to interface using Native mode for better packet interception
+                #     try:
+                #         # Try XDP Native mode first (more reliable for packet capture)
+                #         bpf_prog.attach_xdp(interface, fn, BPF.XDP_FLAGS_DRV_MODE)
+                #         LOG.info("Successfully attached %s to %s using XDP Native mode", func_name, interface)
+                #     except Exception as native_err:
+                #         LOG.warning("XDP Native mode failed (%s), falling back to Generic mode", native_err)
+                #         # Fallback to Generic mode if Native mode is not supported
+                #         bpf_prog.attach_xdp(interface, fn, BPF.XDP_FLAGS_SKB_MODE)
+                #     
+                #     LOG.info("Successfully attached %s to %s (XDP)", func_name, interface)
+                #     
+                # except Exception as e:
+                #     LOG.error("Failed to attach %s to %s (XDP): %s", func_name, interface, e)
+                #     raise
                 pass
 
-            # Attach BPF program
-            parent = "ffff:fff2" if direction == "ingress" else "ffff:fff3"
+            def _attach_af_xdp_programs(self) -> bool:
+                """Attach XDP programs configured for AF_XDP redirect"""
+                # AF_XDP code commented out - using TC eBPF
+                # try:
+                #     LOG.info("Attaching XDP programs for AF_XDP redirect...")
+                #     
+                #     # Create AF_XDP redirect program dynamically
+                #     af_xdp_redirect_prog = f"""
+                # #include <linux/bpf.h>
+                # #include <linux/if_ether.h>
+                # #include <linux/ip.h>
+                # #include <linux/udp.h>
+                # #include <linux/in.h>
+                # 
+                # // AF_XDP socket map
+                # BPF_XSKMAP(xsks_map, 64);
+                # 
+                # // Statistics map
+                # BPF_ARRAY(stats_map, __u64, 16);
+                # 
+                # // Statistics counters
+                # #define STATS_AF_XDP_REDIRECT 10
+                # #define STATS_AF_XDP_PACKETS 11
+                # 
+                # static inline void update_stats(__u32 counter_id, __u64 value) {{
+                #     __u64* count = stats_map.lookup(&counter_id);
+                #     if (count) {{
+                #         __sync_fetch_and_add(count, value);
+                #     }}
+                # }}
+                # 
+                # int af_xdp_redirect_handler(struct xdp_md* ctx) {{
+                #     void* data = (void*)(long)ctx->data;
+                #     void* data_end = (void*)(long)ctx->data_end;
+                #     
+                #     // Parse Ethernet header
+                #     struct ethhdr* eth = data;
+                #     if ((void*)(eth + 1) > data_end) {{
+                #         return XDP_PASS;
+                #     }}
+                #     
+                #     // Check if IPv4
+                #     if (eth->h_proto != __constant_htons(ETH_P_IP)) {{
+                #         return XDP_PASS;
+                #     }}
+                #     
+                #     // Parse IP header
+                #     struct iphdr* ip = (struct iphdr*)(eth + 1);
+                #     if ((void*)(ip + 1) > data_end) {{
+                #         return XDP_PASS;
+                #     }}
+                #     
+                #     // Check if UDP
+                #     if (ip->protocol != IPPROTO_UDP) {{
+                #         return XDP_PASS;
+                #     }}
+                #     
+                #     // Parse UDP header
+                #     struct udphdr* udp = (struct udphdr*)((void*)ip + (ip->ihl * 4));
+                #     if ((void*)(udp + 1) > data_end) {{
+                #         return XDP_PASS;
+                #     }}
+                #     
+                #     // Check if GTP-U port (2152)
+                #     if (udp->dest != __constant_htons(2152)) {{
+                #         return XDP_PASS;
+                #     }}
+                #     
+                #     // Update statistics
+                #     update_stats(STATS_AF_XDP_PACKETS, 1);
+                #     
+                #     // Redirect to AF_XDP socket
+                #     int queue_id = 0;  // Use queue 0 for simplicity
+                #     int ret = bpf_redirect_map(&xsks_map, queue_id, 0);
+                #     if (ret == XDP_REDIRECT) {{
+                #         update_stats(STATS_AF_XDP_REDIRECT, 1);
+                #     }}
+                #     
+                #     return ret;
+                # }}
+                # """
+                #     
+                #     # Load AF_XDP redirect program
+                #     cflags = ['-I', EBPF_GTP_DIR]
+                #     self.af_xdp_bpf = BPF(text=af_xdp_redirect_prog, cflags=cflags)
+                #     
+                #     # Get the XSK map and register our AF_XDP socket
+                #     xsks_map = self.af_xdp_bpf.get_table("xsks_map")
+                #     if self.af_xdp_socket and self.af_xdp_socket.socket:
+                #         xsks_map[0] = self.af_xdp_socket.socket.fileno()
+                #     
+                #     # Attach AF_XDP redirect program to S1-U interface
+                #     LOG.info("Attaching AF_XDP redirect program to %s", self.s1u_iface)
+                #     fn = self.af_xdp_bpf.load_func("af_xdp_redirect_handler", BPF.XDP)
+                #     self.af_xdp_bpf.attach_xdp(self.s1u_iface, fn, BPF.XDP_FLAGS_SKB_MODE)
+                #     
+                #     LOG.info("AF_XDP redirect programs attached successfully")
+                #     return True
+                #     
+                # except Exception as e:
+                #     LOG.error("Failed to attach AF_XDP redirect programs: %s", e)
+                #     import traceback
+                #     LOG.error("Full traceback: %s", traceback.format_exc())
+                #     return False
+                return False
 
-            LOG.debug("Loading function %s from BPF program", func_name)
-            fn = bpf_prog.load_func(func_name, BPF.SCHED_CLS)
-
-            # CRITICAL FIX: Mark handler on gtp_veth0 must NOT use direct_action
-            # With direct_action=True, TC_ACT_OK stops packet processing
-            # We need packets to continue to OVS after mark restoration
-            use_direct_action = True
-            if interface == GTP_VETH_OVS and func_name == "gtp_veth0_mark_handler":
-                LOG.info("Mark handler on %s: Disabling direct_action to allow packets to reach OVS", interface)
-                use_direct_action = False
-
-            LOG.debug("Attaching BPF filter to %s %s (fd=%d, direct_action=%s)",
-                     interface, direction, fn.fd, use_direct_action)
-            self.ipr.tc("add-filter", "bpf", ifindex, ":1",
-                       fd=fn.fd, name=fn.name, parent=parent,
-                       classid=1, direct_action=use_direct_action)
-            
-            LOG.info("Successfully attached %s to %s %s", func_name, interface, direction)
-            
-        except Exception as e:
-            LOG.error("Failed to attach %s to %s %s: %s", func_name, interface, direction, e)
-            raise
-
-    def _setup_flower_redirect(self, interface: str, ifindex: int, target_ifindex: int):
-        """
-        Setup flower filter to redirect GTP traffic to gtp_veth1
-        Using tc command directly for better compatibility
-        Now with separate filters for data and control plane (CRITICAL for kernel module replacement)
-        """
-        try:
-            # Ensure clsact qdisc exists on source interface
-            try:
-                subprocess.run([
-                    'tc', 'qdisc', 'add', 'dev', interface, 'clsact'
-                ], capture_output=True, check=False)
-            except:
-                pass  # OK if already exists
-            
-            # Remove any existing flower filters
-            for prio in ['1', '2']:
-                try:
-                    subprocess.run([
-                        'tc', 'filter', 'del', 'dev', interface, 
-                        'ingress', 'pref', prio
-                    ], capture_output=True, check=False)
-                except:
-                    pass  # OK if doesn't exist
-            
-            # Filter 1: GTP-U data traffic (T-PDU, type 255)
-            cmd_data = [
-                'tc', 'filter', 'add', 'dev', interface,
-                'ingress', 'prio', '1', 'protocol', 'ip',
-                'flower',
-                'ip_proto', 'udp',
-                'dst_port', '2152',
-                'action', 'mirred', 'ingress', 'redirect', 'dev', GTP_VETH_EBPF
-            ]
-            
-            result = subprocess.run(cmd_data, capture_output=True, text=True)
-            if result.returncode != 0:
-                LOG.error("Failed to add data plane filter: %s", result.stderr)
-                raise Exception(f"Data plane tc command failed: {result.stderr}")
-            
-            # Filter 2: GTP-C control traffic (echo, handover, etc.)
-            # This ensures control plane packets also reach our eBPF handler
-            cmd_control = [
-                'tc', 'filter', 'add', 'dev', interface,
-                'ingress', 'prio', '2', 'protocol', 'ip', 
-                'flower',
-                'ip_proto', 'udp',
-                'dst_port', '2123',  # GTP-C port
-                'action', 'mirred', 'ingress', 'redirect', 'dev', GTP_VETH_EBPF
-            ]
-            
-            # Note: GTP-C on 2123 is optional, most control is on 2152
-            subprocess.run(cmd_control, capture_output=True, text=True)
-            
-            LOG.info("Flower filters successfully added on %s to redirect GTP to %s", 
-                     interface, GTP_VETH_EBPF)
-            LOG.info("Data plane (2152) and Control plane (2123) filters active")
-            
-        except Exception as e:
-            LOG.error("Failed to setup flower filter: %s", e)
-            raise
-
-    def _attach_xdp_program(self, interface: str, ifindex: int, bpf_prog: BPF, func_name: str):
-        """
-        Attach eBPF program to interface via XDP
-        
-        Args:
-            interface: Interface name
-            ifindex: Interface index
-            bpf_prog: BPF program object
-            func_name: Function name to attach
-        """
-        # XDP attachment code commented out - using TC eBPF
-        # try:
-        #     LOG.debug("Loading XDP function %s from BPF program", func_name)
-        #     fn = bpf_prog.load_func(func_name, BPF.XDP)
-        #     
-        #     LOG.debug("Attaching XDP program to %s (fd=%d)", interface, fn.fd)
-        #     # Attach XDP program to interface using Native mode for better packet interception
-        #     try:
-        #         # Try XDP Native mode first (more reliable for packet capture)
-        #         bpf_prog.attach_xdp(interface, fn, BPF.XDP_FLAGS_DRV_MODE)
-        #         LOG.info("Successfully attached %s to %s using XDP Native mode", func_name, interface)
-        #     except Exception as native_err:
-        #         LOG.warning("XDP Native mode failed (%s), falling back to Generic mode", native_err)
-        #         # Fallback to Generic mode if Native mode is not supported
-        #         bpf_prog.attach_xdp(interface, fn, BPF.XDP_FLAGS_SKB_MODE)
-        #     
-        #     LOG.info("Successfully attached %s to %s (XDP)", func_name, interface)
-        #     
-        # except Exception as e:
-        #     LOG.error("Failed to attach %s to %s (XDP): %s", func_name, interface, e)
-        #     raise
-        pass
-
-    def _attach_af_xdp_programs(self) -> bool:
-        """Attach XDP programs configured for AF_XDP redirect"""
-        # AF_XDP code commented out - using TC eBPF
-        # try:
-        #     LOG.info("Attaching XDP programs for AF_XDP redirect...")
-        #     
-        #     # Create AF_XDP redirect program dynamically
-        #     af_xdp_redirect_prog = f"""
-        # #include <linux/bpf.h>
-        # #include <linux/if_ether.h>
-        # #include <linux/ip.h>
-        # #include <linux/udp.h>
-        # #include <linux/in.h>
-        # 
-        # // AF_XDP socket map
-        # BPF_XSKMAP(xsks_map, 64);
-        # 
-        # // Statistics map
-        # BPF_ARRAY(stats_map, __u64, 16);
-        # 
-        # // Statistics counters
-        # #define STATS_AF_XDP_REDIRECT 10
-        # #define STATS_AF_XDP_PACKETS 11
-        # 
-        # static inline void update_stats(__u32 counter_id, __u64 value) {{
-        #     __u64* count = stats_map.lookup(&counter_id);
-        #     if (count) {{
-        #         __sync_fetch_and_add(count, value);
-        #     }}
-        # }}
-        # 
-        # int af_xdp_redirect_handler(struct xdp_md* ctx) {{
-        #     void* data = (void*)(long)ctx->data;
-        #     void* data_end = (void*)(long)ctx->data_end;
-        #     
-        #     // Parse Ethernet header
-        #     struct ethhdr* eth = data;
-        #     if ((void*)(eth + 1) > data_end) {{
-        #         return XDP_PASS;
-        #     }}
-        #     
-        #     // Check if IPv4
-        #     if (eth->h_proto != __constant_htons(ETH_P_IP)) {{
-        #         return XDP_PASS;
-        #     }}
-        #     
-        #     // Parse IP header
-        #     struct iphdr* ip = (struct iphdr*)(eth + 1);
-        #     if ((void*)(ip + 1) > data_end) {{
-        #         return XDP_PASS;
-        #     }}
-        #     
-        #     // Check if UDP
-        #     if (ip->protocol != IPPROTO_UDP) {{
-        #         return XDP_PASS;
-        #     }}
-        #     
-        #     // Parse UDP header
-        #     struct udphdr* udp = (struct udphdr*)((void*)ip + (ip->ihl * 4));
-        #     if ((void*)(udp + 1) > data_end) {{
-        #         return XDP_PASS;
-        #     }}
-        #     
-        #     // Check if GTP-U port (2152)
-        #     if (udp->dest != __constant_htons(2152)) {{
-        #         return XDP_PASS;
-        #     }}
-        #     
-        #     // Update statistics
-        #     update_stats(STATS_AF_XDP_PACKETS, 1);
-        #     
-        #     // Redirect to AF_XDP socket
-        #     int queue_id = 0;  // Use queue 0 for simplicity
-        #     int ret = bpf_redirect_map(&xsks_map, queue_id, 0);
-        #     if (ret == XDP_REDIRECT) {{
-        #         update_stats(STATS_AF_XDP_REDIRECT, 1);
-        #     }}
-        #     
-        #     return ret;
-        # }}
-        # """
-        #     
-        #     # Load AF_XDP redirect program
-        #     cflags = ['-I', EBPF_GTP_DIR]
-        #     self.af_xdp_bpf = BPF(text=af_xdp_redirect_prog, cflags=cflags)
-        #     
-        #     # Get the XSK map and register our AF_XDP socket
-        #     xsks_map = self.af_xdp_bpf.get_table("xsks_map")
-        #     if self.af_xdp_socket and self.af_xdp_socket.socket:
-        #         xsks_map[0] = self.af_xdp_socket.socket.fileno()
-        #     
-        #     # Attach AF_XDP redirect program to S1-U interface
-        #     LOG.info("Attaching AF_XDP redirect program to %s", self.s1u_iface)
-        #     fn = self.af_xdp_bpf.load_func("af_xdp_redirect_handler", BPF.XDP)
-        #     self.af_xdp_bpf.attach_xdp(self.s1u_iface, fn, BPF.XDP_FLAGS_SKB_MODE)
-        #     
-        #     LOG.info("AF_XDP redirect programs attached successfully")
-        #     return True
-        #     
-        # except Exception as e:
-        #     LOG.error("Failed to attach AF_XDP redirect programs: %s", e)
-        #     import traceback
-        #     LOG.error("Full traceback: %s", traceback.format_exc())
-        #     return False
-        return False
-
-    def get_statistics(self) -> Dict:
-        """
-        Get eBPF GTP statistics - Step 6: Full statistics (per-UE metrics)
-        
-        Returns:
-            Dictionary containing comprehensive statistics
-        """
-        try:
-            stats = {}
-            
-            # Global statistics - all counters
-            stats_names = {
-                STATS_UL_PACKETS: "ul_packets",
-                STATS_DL_PACKETS: "dl_packets", 
-                STATS_UL_BYTES: "ul_bytes",
-                STATS_DL_BYTES: "dl_bytes",
-                STATS_UL_ERRORS: "ul_errors",
-                STATS_DL_ERRORS: "dl_errors",
-                STATS_GTP_INVALID: "gtp_invalid",
-                STATS_SESSION_MISS: "session_miss",
-                STATS_GTP_DECAP_SUCCESS: "gtp_decap_success",
-                STATS_GTP_ENCAP_SUCCESS: "gtp_encap_success",
-                STATS_TEID_MISMATCH: "teid_mismatch",
-                STATS_UE_ATTACH: "ue_attach",
-                STATS_UE_DETACH: "ue_detach",
-                STATS_PKT_DROPPED: "packets_dropped",
-                STATS_PKT_FORWARDED: "packets_forwarded"
-            }
-            
-            global_stats = {}
-            for key, name in stats_names.items():
-                try:
-                    value = self.stats_map[key].value
-                    global_stats[name] = value
-                except (KeyError, AttributeError):
-                    global_stats[name] = 0
-            
-            stats['global'] = global_stats
-            
-            # Per-UE statistics with enhanced metrics
-            ue_stats = {}
-            for session_key, session_info in self.ue_session_map.items():
-                ue_ip = socket.inet_ntoa(struct.pack("!I", session_key.ue_ip))
-                ue_stats[ue_ip] = {
-                    # Traffic counters
-                    'ul_packets': session_info.ul_packets,
-                    'dl_packets': session_info.dl_packets,
-                    'ul_bytes': session_info.ul_bytes,
-                    'dl_bytes': session_info.dl_bytes,
-                    
-                    # Session metadata
-                    'last_seen': session_info.last_seen,
-                    'session_flags': session_info.session_flags,
-                    
-                    # Tunnel information
-                    'teid_in': session_info.teid_in,
-                    'teid_out': session_info.teid_out,
-                    'enb_ip': socket.inet_ntoa(struct.pack("!I", session_info.enb_ip)),
-                    
-                    # Derived metrics
-                    'total_packets': session_info.ul_packets + session_info.dl_packets,
-                    'total_bytes': session_info.ul_bytes + session_info.dl_bytes,
-                    'is_active': bool(session_info.session_flags & 1)
-                }
-            
-            stats['ue_sessions'] = ue_stats
-            
-            # Additional derived statistics  
-            stats['summary'] = {
-                'total_ue_sessions': len(ue_stats),
-                'active_ue_sessions': len([s for s in ue_stats.values() if s['is_active']]),
-                'total_ul_packets': global_stats['ul_packets'],
-                'total_dl_packets': global_stats['dl_packets'],
-                'total_packets': global_stats['ul_packets'] + global_stats['dl_packets'],
-                'total_ul_bytes': global_stats['ul_bytes'],
-                'total_dl_bytes': global_stats['dl_bytes'],
-                'total_bytes': global_stats['ul_bytes'] + global_stats['dl_bytes'],
-                'error_rate': ((global_stats['ul_errors'] + global_stats['dl_errors']) / 
-                              max(global_stats['ul_packets'] + global_stats['dl_packets'], 1)) * 100,
-                'session_miss_rate': (global_stats['session_miss'] / 
-                                     max(global_stats['ul_packets'] + global_stats['dl_packets'], 1)) * 100
-            }
-            
-            return stats
-            
-        except Exception as e:
-            LOG.error("Failed to get statistics: %s", e)
-            import traceback
-            LOG.error("Full traceback: %s", traceback.format_exc())
-            return {}
-
-    def _get_interface_ip(self, interface: str) -> Optional[str]:
-        """
-        Get IP address of an interface
-        
-        Args:
-            interface: Interface name
-            
-        Returns:
-            IP address as string or None
-        """
-        try:
-            pass
-        except:
-            pass
-        return None
-    
-    def _get_ifindex(self, interface: str) -> Optional[int]:
-        """Get interface index by name"""
-        try:
-            for link in self.ipr.get_links():
-                if link.get_attr('IFLA_IFNAME') == interface:
-                    return link['index']
-            return None
-        except Exception as e:
-            LOG.error("Failed to get interface index for %s: %s", interface, e)
-            return None
-
-    def _get_mac_bytes(self, interface: str) -> bytes:
-        """Get MAC address as bytes"""
-        try:
-            mac_str = get_mac_address_from_iface(interface)
-            return bytes.fromhex(mac_str.replace(':', ''))
-        except Exception:
-            return b'\x02\x00\x00\x00\x00\x01'  # Default MAC
-
-    def register_interface_callback(self, callback):
-        """
-        Register a callback to be called when gtp_veth0 interface is created/recreated
-        CRITICAL for notifying classifier to refresh flows when port numbers change
-        """
-        self._interface_callbacks.append(callback)
-        LOG.debug("Registered interface callback: %s", callback)
-    
-    def _notify_interface_created(self):
-        """
-        Notify all registered callbacks that gtp_veth0 interface was created/recreated
-        CRITICAL for ensuring OVS flows are updated when port numbers change
-        """
-        try:
-            for callback in self._interface_callbacks:
-                try:
-                    callback()
-                    LOG.debug("Interface callback executed successfully")
-                except Exception as e:
-                    LOG.error("Interface callback failed: %s", e)
-        except Exception as e:
-            LOG.error("Failed to notify interface callbacks: %s", e)
-
-    def _setup_ue_subnet_proxy_arp(self):
-        """
-        Setup proxy ARP for entire UE subnet (192.168.128.0/24) to handle
-        dynamic UE IPs without requiring individual ARP entries.
-
-        Phase 1: Basic proxy ARP setup for datapath functionality
-        """
-        try:
-            import subprocess
-
-            LOG.info("Setting up proxy ARP for UE subnet 192.168.128.0/24")
-
-            # Enable proxy ARP on gtp_br0
-            try:
-                subprocess.run([
-                    'sysctl', '-w', 'net.ipv4.conf.gtp_br0.proxy_arp=1'
-                ], check=True, capture_output=True)
-                LOG.info("Enabled proxy ARP on gtp_br0")
-            except subprocess.CalledProcessError as e:
-                LOG.warning("Failed to enable proxy ARP on gtp_br0: %s", e)
-
-            # Enable proxy ARP PVLAN for better subnet handling
-            try:
-                subprocess.run([
-                    'sysctl', '-w', 'net.ipv4.conf.gtp_br0.proxy_arp_pvlan=1'
-                ], check=True, capture_output=True)
-                LOG.info("Enabled proxy ARP PVLAN on gtp_br0")
-            except subprocess.CalledProcessError as e:
-                LOG.warning("Failed to enable proxy ARP PVLAN on gtp_br0: %s", e)
-
-            # Add the UE subnet route to gtp_veth0
-            try:
-                subprocess.run([
-                    'ip', 'route', 'add', '192.168.128.0/24', 'dev', GTP_VETH_OVS, 'scope', 'link'
-                ], capture_output=True)
-                LOG.info("Added UE subnet route via %s", GTP_VETH_OVS)
-            except subprocess.CalledProcessError as e:
-                LOG.debug("Route setup had issues (may already exist): %s", e)
-
-            return True
-
-        except Exception as e:
-            LOG.error("Failed to setup proxy ARP for UE subnet: %s", e)
-            return False
-
-    def debug_session_byte_order(self) -> None:
-        """
-        Debug method to check byte order issues in stored sessions
-        """
-        try:
-            if not self.enabled or not self.ue_session_map:
-                LOG.warning("eBPF not enabled or map not available")
-                return
+            def get_statistics(self) -> Dict:
+                """
+                Get eBPF GTP statistics - Step 6: Full statistics (per-UE metrics)
                 
-            LOG.info("=== Debugging eBPF Session Byte Order ===")
-            
-            # Iterate through all sessions
-            for key, value in self.ue_session_map.items():
-                # Key is 4 bytes (IP address)
-                if len(key) >= 4:
-                    # Extract IP as different byte orders
-                    ip_be = struct.unpack("!I", key[:4])[0]  # Big-endian (network order)
-                    ip_le = struct.unpack("<I", key[:4])[0]  # Little-endian
-                    
-                    # Convert to dotted notation
-                    ip_be_str = socket.inet_ntoa(struct.pack("!I", ip_be))
-                    ip_le_str = socket.inet_ntoa(struct.pack("!I", ip_le))
-                    
-                    LOG.info("Session key: 0x%08x (BE: %s, LE: %s)", 
-                             ip_be, ip_be_str, ip_le_str)
-                    
-                    # Check which one looks correct (should be in 192.168.128.0/24)
-                    if ip_be_str.startswith("192.168.128."):
-                        LOG.info("  -> Correct byte order (big-endian)")
-                    elif ip_le_str.startswith("192.168.128."):
-                        LOG.warning("  -> WRONG byte order! Should be: %s", ip_le_str)
-                    else:
-                        LOG.warning("  -> IP not in expected range")
-                        
-        except Exception as e:
-            LOG.error("Failed to debug byte order: %s", e)
-
-    def cleanup(self):
-        """
-        Cleanup all eBPF programs and filters
-        """
-        LOG.info("Cleaning up eBPF GTP manager...")
-        
-        try:
-            # Remove flower filter from s1u interface
-            s1u_ifindex = self._get_ifindex(self.s1u_iface)
-            if s1u_ifindex:
+                Returns:
+                    Dictionary containing comprehensive statistics
+                """
                 try:
-                    subprocess.run([
-                        'tc', 'filter', 'del', 'dev', self.s1u_iface,
-                        'ingress', 'pref', '1'
-                    ], capture_output=True, check=False)
-                    LOG.info("Removed flower filter from %s", self.s1u_iface)
+                    stats = {}
+                    
+                    # Global statistics - all counters
+                    stats_names = {
+                        STATS_UL_PACKETS: "ul_packets",
+                        STATS_DL_PACKETS: "dl_packets", 
+                        STATS_UL_BYTES: "ul_bytes",
+                        STATS_DL_BYTES: "dl_bytes",
+                        STATS_UL_ERRORS: "ul_errors",
+                        STATS_DL_ERRORS: "dl_errors",
+                        STATS_GTP_INVALID: "gtp_invalid",
+                        STATS_SESSION_MISS: "session_miss",
+                        STATS_GTP_DECAP_SUCCESS: "gtp_decap_success",
+                        STATS_GTP_ENCAP_SUCCESS: "gtp_encap_success",
+                        STATS_TEID_MISMATCH: "teid_mismatch",
+                        STATS_UE_ATTACH: "ue_attach",
+                        STATS_UE_DETACH: "ue_detach",
+                        STATS_PKT_DROPPED: "packets_dropped",
+                        STATS_PKT_FORWARDED: "packets_forwarded"
+                    }
+                    
+                    global_stats = {}
+                    for key, name in stats_names.items():
+                        try:
+                            value = self.stats_map[key].value
+                            global_stats[name] = value
+                        except (KeyError, AttributeError):
+                            global_stats[name] = 0
+                    
+                    stats['global'] = global_stats
+                    
+                    # Per-UE statistics with enhanced metrics
+                    ue_stats = {}
+                    for session_key, session_info in self.ue_session_map.items():
+                        ue_ip = socket.inet_ntoa(struct.pack("!I", session_key.ue_ip))
+                        ue_stats[ue_ip] = {
+                            # Traffic counters
+                            'ul_packets': session_info.ul_packets,
+                            'dl_packets': session_info.dl_packets,
+                            'ul_bytes': session_info.ul_bytes,
+                            'dl_bytes': session_info.dl_bytes,
+                            
+                            # Session metadata
+                            'last_seen': session_info.last_seen,
+                            'session_flags': session_info.session_flags,
+                            
+                            # Tunnel information
+                            'teid_in': session_info.teid_in,
+                            'teid_out': session_info.teid_out,
+                            'enb_ip': socket.inet_ntoa(struct.pack("!I", session_info.enb_ip)),
+                            
+                            # Derived metrics
+                            'total_packets': session_info.ul_packets + session_info.dl_packets,
+                            'total_bytes': session_info.ul_bytes + session_info.dl_bytes,
+                            'is_active': bool(session_info.session_flags & 1)
+                        }
+                    
+                    stats['ue_sessions'] = ue_stats
+                    
+                    # Additional derived statistics  
+                    stats['summary'] = {
+                        'total_ue_sessions': len(ue_stats),
+                        'active_ue_sessions': len([s for s in ue_stats.values() if s['is_active']]),
+                        'total_ul_packets': global_stats['ul_packets'],
+                        'total_dl_packets': global_stats['dl_packets'],
+                        'total_packets': global_stats['ul_packets'] + global_stats['dl_packets'],
+                        'total_ul_bytes': global_stats['ul_bytes'],
+                        'total_dl_bytes': global_stats['dl_bytes'],
+                        'total_bytes': global_stats['ul_bytes'] + global_stats['dl_bytes'],
+                        'error_rate': ((global_stats['ul_errors'] + global_stats['dl_errors']) / 
+                                    max(global_stats['ul_packets'] + global_stats['dl_packets'], 1)) * 100,
+                        'session_miss_rate': (global_stats['session_miss'] / 
+                                            max(global_stats['ul_packets'] + global_stats['dl_packets'], 1)) * 100
+                    }
+                    
+                    return stats
+                    
+                except Exception as e:
+                    LOG.error("Failed to get statistics: %s", e)
+                    import traceback
+                    LOG.error("Full traceback: %s", traceback.format_exc())
+                    return {}
+
+            def _get_interface_ip(self, interface: str) -> Optional[str]:
+                """
+                Get IP address of an interface
+                
+                Args:
+                    interface: Interface name
+                    
+                Returns:
+                    IP address as string or None
+                """
+                try:
+                    pass
                 except:
                     pass
-        except:
-            pass
-        
-        try:
-            # Remove TC filters from gtp_veth1
-            ebpf_ifindex = self._get_ifindex(GTP_VETH_EBPF)
-            if ebpf_ifindex:
-                try:
-                    subprocess.run([
-                        'tc', 'qdisc', 'del', 'dev', GTP_VETH_EBPF, 'clsact'
-                    ], capture_output=True, check=False)
-                    LOG.info("Removed clsact qdisc from %s", GTP_VETH_EBPF)
-                except:
-                    pass
-        except:
-            pass
-        
-        # Close BPF programs
-        if hasattr(self, 'combined_bpf'):
-            del self.combined_bpf
-        if hasattr(self, 'decap_bpf'):
-            del self.decap_bpf
-        if hasattr(self, 'encap_bpf'):
-            del self.encap_bpf
-        if hasattr(self, 'veth0_mark_bpf'):
-            del self.veth0_mark_bpf
-
-        # No map pinning cleanup needed with Strategy 1
-        # Maps are automatically cleaned up when BPF program is deleted
-        
-        # Remove veth pair
-        self._cleanup_veth_pair()
-        
-        # Close control plane echo handler
-        if hasattr(self, '_echo_thread') and self._echo_thread:
-            self._stop_echo_handler = True
-            self._echo_thread.join(timeout=2.0)
-        
-        # Close IPRoute
-        if hasattr(self, 'ipr'):
-            self.ipr.close()
-        
-        self.enabled = False
-        LOG.info("eBPF GTP manager cleanup completed")
-    
-    def _cleanup_veth_pair(self):
-        """Remove veth pair if it exists"""
-        try:
-            self.ipr.link("del", ifname=GTP_VETH_OVS)
-            LOG.info("Removed veth pair %s", GTP_VETH_OVS)
-        except:
-            pass  # Already removed
-    
-    def is_ebpf_gtp_enabled(self) -> bool:
-        """
-        Check if eBPF GTP is enabled
-        
-        Returns:
-            bool: True if eBPF GTP is enabled and initialized
-        """
-        return self.enabled
-
-    def _parse_session_value_ctypes(self, bpf_value) -> Optional[Dict[str, Any]]:
-        """Parse BPF session value using ctypes."""
-        try:
-            # If bpf_value is already a UeSessionInfo ctypes structure, use it directly
-            if isinstance(bpf_value, UeSessionInfo):
-                value = bpf_value
-            else:
-                # This shouldn't happen with proper ctypes usage
-                LOG.warning("Unexpected value type in _parse_session_value_ctypes: %s", type(bpf_value))
                 return None
             
-            # Convert network byte order IPs to host strings
-            if sys.byteorder == 'little':
-                enb_ip = socket.inet_ntoa(socket.htonl(value.enb_ip).to_bytes(4, 'big'))
-                tun_ipv4_dst = socket.inet_ntoa(socket.htonl(value.tun_ipv4_dst).to_bytes(4, 'big'))
-            else:
-                enb_ip = socket.inet_ntoa(value.enb_ip.to_bytes(4, 'big'))
-                tun_ipv4_dst = socket.inet_ntoa(value.tun_ipv4_dst.to_bytes(4, 'big'))
-            
-            # Extract IMSI string
-            imsi_str = ''
-            if value.imsi_len > 0:
-                imsi_bytes = bytes(value.imsi[:value.imsi_len])
+            def _get_ifindex(self, interface: str) -> Optional[int]:
+                """Get interface index by name"""
                 try:
-                    imsi_str = imsi_bytes.decode('utf-8')
-                except:
-                    imsi_str = imsi_bytes.hex()
-            
-            # Convert MAC addresses to hex strings
-            ul_mac_src = ':'.join(f'{b:02x}' for b in value.ul_mac_src)
-            ul_mac_dst = ':'.join(f'{b:02x}' for b in value.ul_mac_dst)
-            
-            # Determine session state
-            state = 'active' if value.session_flags & 0x1 else 'inactive'
-            
-            return {
-                'enb_ip': enb_ip,
-                'teid_ul_in': value.teid_ul_in,
-                'teid_ul_out': value.teid_ul_out,
-                'teid_dl_in': value.teid_dl_in,
-                'teid_dl_out': value.teid_dl_out,
-                's1u_ifindex': value.s1u_ifindex,
-                'ul_mac_src': ul_mac_src,
-                'ul_mac_dst': ul_mac_dst,
-                'qos_mark': value.qos_mark,
-                'bearer_id': value.bearer_id,
-                'ul_bytes': value.ul_bytes,
-                'dl_bytes': value.dl_bytes,
-                'ul_packets': value.ul_packets,
-                'dl_packets': value.dl_packets,
-                'last_seen_ns': value.last_seen,
-                'session_flags': value.session_flags,
-                'state': state,
-                'imsi': imsi_str,
-                'imsi_len': value.imsi_len,
-                'encoded_imsi': value.encoded_imsi,
-                'qfi': value.qfi,
-                'tunnel_id': value.tunnel_id,
-                'tun_ipv4_dst': tun_ipv4_dst,
-                'tun_flags': value.tun_flags,
-                'direction': value.direction,
-                'original_port': value.original_port,
-                'metadata_mark': value.metadata_mark
-            }
-            
-        except Exception as e:
-            LOG.error("Failed to parse session value with ctypes: %s", e)
-            return None
-
-    def _parse_session_value(self, bpf_value) -> Optional[Dict[str, Any]]:
-        """Parse raw BPF session value into a dict."""
-        try:
-            if hasattr(bpf_value, 'value'):
-                raw_data = bpf_value.value
-            elif isinstance(bpf_value, bytes):
-                raw_data = bpf_value
-            else:
-                raw_data = bytes(bpf_value)
-
-            try:
-                if len(raw_data) >= SESSION_STRUCT_SIZE:
-                    unpacked = struct.unpack(SESSION_STRUCT_FMT, raw_data[:SESSION_STRUCT_SIZE])
-                    metadata_mark = unpacked[-1]
-                    reserved_bytes = unpacked[-2]
-                elif len(raw_data) >= SESSION_STRUCT_SIZE_LEGACY:
-                    unpacked = struct.unpack(SESSION_STRUCT_FMT_LEGACY, raw_data[:SESSION_STRUCT_SIZE_LEGACY])
-                    metadata_mark = None
-                    reserved_bytes = b'\x00\x00\x00'
-                else:
-                    LOG.warning("Session data too short: %d bytes", len(raw_data))
+                    for link in self.ipr.get_links():
+                        if link.get_attr('IFLA_IFNAME') == interface:
+                            return link['index']
                     return None
-            except struct.error as e:
-                LOG.warning("Failed to parse session struct (size=%d): %s", len(raw_data), e)
+                except Exception as e:
+                    LOG.error("Failed to get interface index for %s: %s", interface, e)
+                    return None
+
+            def _get_mac_bytes(self, interface: str) -> bytes:
+                """Get MAC address as bytes"""
+                try:
+                    mac_str = get_mac_address_from_iface(interface)
+                    return bytes.fromhex(mac_str.replace(':', ''))
+                except Exception:
+                    return b'\x02\x00\x00\x00\x00\x01'  # Default MAC
+
+            def register_interface_callback(self, callback):
+                """
+                Register a callback to be called when gtp_veth0 interface is created/recreated
+                CRITICAL for notifying classifier to refresh flows when port numbers change
+                """
+                self._interface_callbacks.append(callback)
+                LOG.debug("Registered interface callback: %s", callback)
+            
+            def _notify_interface_created(self):
+                """
+                Notify all registered callbacks that gtp_veth0 interface was created/recreated
+                CRITICAL for ensuring OVS flows are updated when port numbers change
+                """
+                try:
+                    for callback in self._interface_callbacks:
+                        try:
+                            callback()
+                            LOG.debug("Interface callback executed successfully")
+                        except Exception as e:
+                            LOG.error("Interface callback failed: %s", e)
+                except Exception as e:
+                    LOG.error("Failed to notify interface callbacks: %s", e)
+
+            def _setup_ue_subnet_proxy_arp(self):
+                """
+                Setup proxy ARP for entire UE subnet (192.168.128.0/24) to handle
+                dynamic UE IPs without requiring individual ARP entries.
+
+                Phase 1: Basic proxy ARP setup for datapath functionality
+                """
+                try:
+                    import subprocess
+
+                    LOG.info("Setting up proxy ARP for UE subnet 192.168.128.0/24")
+
+                    # Enable proxy ARP on gtp_br0
+                    try:
+                        subprocess.run([
+                            'sysctl', '-w', 'net.ipv4.conf.gtp_br0.proxy_arp=1'
+                        ], check=True, capture_output=True)
+                        LOG.info("Enabled proxy ARP on gtp_br0")
+                    except subprocess.CalledProcessError as e:
+                        LOG.warning("Failed to enable proxy ARP on gtp_br0: %s", e)
+
+                    # Enable proxy ARP PVLAN for better subnet handling
+                    try:
+                        subprocess.run([
+                            'sysctl', '-w', 'net.ipv4.conf.gtp_br0.proxy_arp_pvlan=1'
+                        ], check=True, capture_output=True)
+                        LOG.info("Enabled proxy ARP PVLAN on gtp_br0")
+                    except subprocess.CalledProcessError as e:
+                        LOG.warning("Failed to enable proxy ARP PVLAN on gtp_br0: %s", e)
+
+                    # Add the UE subnet route to gtp_veth0
+                    try:
+                        subprocess.run([
+                            'ip', 'route', 'add', '192.168.128.0/24', 'dev', GTP_VETH_OVS, 'scope', 'link'
+                        ], capture_output=True)
+                        LOG.info("Added UE subnet route via %s", GTP_VETH_OVS)
+                    except subprocess.CalledProcessError as e:
+                        LOG.debug("Route setup had issues (may already exist): %s", e)
+
+                    return True
+
+                except Exception as e:
+                    LOG.error("Failed to setup proxy ARP for UE subnet: %s", e)
+                    return False
+
+            def debug_session_byte_order(self) -> None:
+                """
+                Debug method to check byte order issues in stored sessions
+                """
+                try:
+                    if not self.enabled or not self.ue_session_map:
+                        LOG.warning("eBPF not enabled or map not available")
+                        return
+                        
+                    LOG.info("=== Debugging eBPF Session Byte Order ===")
+                    
+                    # Iterate through all sessions
+                    for key, value in self.ue_session_map.items():
+                        # Key is 4 bytes (IP address)
+                        if len(key) >= 4:
+                            # Extract IP as different byte orders
+                            ip_be = struct.unpack("!I", key[:4])[0]  # Big-endian (network order)
+                            ip_le = struct.unpack("<I", key[:4])[0]  # Little-endian
+                            
+                            # Convert to dotted notation
+                            ip_be_str = socket.inet_ntoa(struct.pack("!I", ip_be))
+                            ip_le_str = socket.inet_ntoa(struct.pack("!I", ip_le))
+                            
+                            LOG.info("Session key: 0x%08x (BE: %s, LE: %s)", 
+                                    ip_be, ip_be_str, ip_le_str)
+                            
+                            # Check which one looks correct (should be in 192.168.128.0/24)
+                            if ip_be_str.startswith("192.168.128."):
+                                LOG.info("  -> Correct byte order (big-endian)")
+                            elif ip_le_str.startswith("192.168.128."):
+                                LOG.warning("  -> WRONG byte order! Should be: %s", ip_le_str)
+                            else:
+                                LOG.warning("  -> IP not in expected range")
+                                
+                except Exception as e:
+                    LOG.error("Failed to debug byte order: %s", e)
+
+            def cleanup(self):
+                """
+                Cleanup all eBPF programs and filters
+                """
+                LOG.info("Cleaning up eBPF GTP manager...")
+                
+                try:
+                    # Remove flower filter from s1u interface
+                    s1u_ifindex = self._get_ifindex(self.s1u_iface)
+                    if s1u_ifindex:
+                        try:
+                            subprocess.run([
+                                'tc', 'filter', 'del', 'dev', self.s1u_iface,
+                                'ingress', 'pref', '1'
+                            ], capture_output=True, check=False)
+                            LOG.info("Removed flower filter from %s", self.s1u_iface)
+                        except:
+                            pass
+                except:
+                    pass
+                
+                try:
+                    # Remove TC filters from gtp_veth1
+                    ebpf_ifindex = self._get_ifindex(GTP_VETH_EBPF)
+                    if ebpf_ifindex:
+                        try:
+                            subprocess.run([
+                                'tc', 'qdisc', 'del', 'dev', GTP_VETH_EBPF, 'clsact'
+                            ], capture_output=True, check=False)
+                            LOG.info("Removed clsact qdisc from %s", GTP_VETH_EBPF)
+                        except:
+                            pass
+                except:
+                    pass
+                
+                # Close BPF programs
+                if hasattr(self, 'combined_bpf'):
+                    del self.combined_bpf
+                if hasattr(self, 'decap_bpf'):
+                    del self.decap_bpf
+                if hasattr(self, 'encap_bpf'):
+                    del self.encap_bpf
+                if hasattr(self, 'veth0_mark_bpf'):
+                    del self.veth0_mark_bpf
+
+                # No map pinning cleanup needed with Strategy 1
+                # Maps are automatically cleaned up when BPF program is deleted
+                
+                # Remove veth pair
+                self._cleanup_veth_pair()
+                
+                # Close control plane echo handler
+                if hasattr(self, '_echo_thread') and self._echo_thread:
+                    self._stop_echo_handler = True
+                    self._echo_thread.join(timeout=2.0)
+                
+                # Close IPRoute
+                if hasattr(self, 'ipr'):
+                    self.ipr.close()
+                
+                self.enabled = False
+                LOG.info("eBPF GTP manager cleanup completed")
+            
+            def _cleanup_veth_pair(self):
+                """Remove veth pair if it exists"""
+                try:
+                    self.ipr.link("del", ifname=GTP_VETH_OVS)
+                    LOG.info("Removed veth pair %s", GTP_VETH_OVS)
+                except:
+                    pass  # Already removed
+            
+            def is_ebpf_gtp_enabled(self) -> bool:
+                """
+                Check if eBPF GTP is enabled
+                
+                Returns:
+                    bool: True if eBPF GTP is enabled and initialized
+                """
+                return self.enabled
+
+            def _parse_session_value_ctypes(self, bpf_value) -> Optional[Dict[str, Any]]:
+                """Parse BPF session value using ctypes."""
+                try:
+                    # If bpf_value is already a UeSessionInfo ctypes structure, use it directly
+                    if isinstance(bpf_value, UeSessionInfo):
+                        value = bpf_value
+                    else:
+                        # This shouldn't happen with proper ctypes usage
+                        LOG.warning("Unexpected value type in _parse_session_value_ctypes: %s", type(bpf_value))
+                        return None
+                    
+                    # Convert network byte order IPs to host strings
+                    if sys.byteorder == 'little':
+                        enb_ip = socket.inet_ntoa(socket.htonl(value.enb_ip).to_bytes(4, 'big'))
+                        tun_ipv4_dst = socket.inet_ntoa(socket.htonl(value.tun_ipv4_dst).to_bytes(4, 'big'))
+                    else:
+                        enb_ip = socket.inet_ntoa(value.enb_ip.to_bytes(4, 'big'))
+                        tun_ipv4_dst = socket.inet_ntoa(value.tun_ipv4_dst.to_bytes(4, 'big'))
+                    
+                    # Extract IMSI string
+                    imsi_str = ''
+                    if value.imsi_len > 0:
+                        imsi_bytes = bytes(value.imsi[:value.imsi_len])
+                        try:
+                            imsi_str = imsi_bytes.decode('utf-8')
+                        except:
+                            imsi_str = imsi_bytes.hex()
+                    
+                    # Convert MAC addresses to hex strings
+                    ul_mac_src = ':'.join(f'{b:02x}' for b in value.ul_mac_src)
+                    ul_mac_dst = ':'.join(f'{b:02x}' for b in value.ul_mac_dst)
+                    
+                    # Determine session state
+                    state = 'active' if value.session_flags & 0x1 else 'inactive'
+                    
+                    return {
+                        'enb_ip': enb_ip,
+                        'teid_ul_in': value.teid_ul_in,
+                        'teid_ul_out': value.teid_ul_out,
+                        'teid_dl_in': value.teid_dl_in,
+                        'teid_dl_out': value.teid_dl_out,
+                        's1u_ifindex': value.s1u_ifindex,
+                        'ul_mac_src': ul_mac_src,
+                        'ul_mac_dst': ul_mac_dst,
+                        'qos_mark': value.qos_mark,
+                        'bearer_id': value.bearer_id,
+                        'ul_bytes': value.ul_bytes,
+                        'dl_bytes': value.dl_bytes,
+                        'ul_packets': value.ul_packets,
+                        'dl_packets': value.dl_packets,
+                        'last_seen_ns': value.last_seen,
+                        'session_flags': value.session_flags,
+                        'state': state,
+                        'imsi': imsi_str,
+                        'imsi_len': value.imsi_len,
+                        'encoded_imsi': value.encoded_imsi,
+                        'qfi': value.qfi,
+                        'tunnel_id': value.tunnel_id,
+                        'tun_ipv4_dst': tun_ipv4_dst,
+                        'tun_flags': value.tun_flags,
+                        'direction': value.direction,
+                        'original_port': value.original_port,
+                        'metadata_mark': value.metadata_mark
+                    }
+                    
+                except Exception as e:
+                    LOG.error("Failed to parse session value with ctypes: %s", e)
+                    return None
+
+            def _parse_session_value(self, bpf_value) -> Optional[Dict[str, Any]]:
+                """Parse raw BPF session value into a dict."""
+                try:
+                    if hasattr(bpf_value, 'value'):
+                        raw_data = bpf_value.value
+                    elif isinstance(bpf_value, bytes):
+                        raw_data = bpf_value
+                    else:
+                        raw_data = bytes(bpf_value)
+
+                    try:
+                        if len(raw_data) >= SESSION_STRUCT_SIZE:
+                            unpacked = struct.unpack(SESSION_STRUCT_FMT, raw_data[:SESSION_STRUCT_SIZE])
+                            metadata_mark = unpacked[-1]
+                            reserved_bytes = unpacked[-2]
+                        elif len(raw_data) >= SESSION_STRUCT_SIZE_LEGACY:
+                            unpacked = struct.unpack(SESSION_STRUCT_FMT_LEGACY, raw_data[:SESSION_STRUCT_SIZE_LEGACY])
+                            metadata_mark = None
+                            reserved_bytes = b'\x00\x00\x00'
+                        else:
+                            LOG.warning("Session data too short: %d bytes", len(raw_data))
+                            return None
+                    except struct.error as e:
+                        LOG.warning("Failed to parse session struct (size=%d): %s", len(raw_data), e)
+                        return None
+
+                    idx = 0
+                    enb_ip_int = unpacked[idx]; idx += 1
+                    teid_ul_in = unpacked[idx]; idx += 1
+                    teid_ul_out = unpacked[idx]; idx += 1
+                    teid_dl_in = unpacked[idx]; idx += 1
+                    teid_dl_out = unpacked[idx]; idx += 1
+                    s1u_ifindex = unpacked[idx]; idx += 1
+                    sgi_ifindex = unpacked[idx]; idx += 1
+                    ovs_ifindex = unpacked[idx]; idx += 1
+                    ul_mac_src = unpacked[idx]; idx += 1
+                    ul_mac_dst = unpacked[idx]; idx += 1
+                    qos_mark = unpacked[idx]; idx += 1
+                    bearer_id = unpacked[idx]; idx += 1
+                    ul_bytes = unpacked[idx]; idx += 1
+                    dl_bytes = unpacked[idx]; idx += 1
+                    ul_packets = unpacked[idx]; idx += 1
+                    dl_packets = unpacked[idx]; idx += 1
+                    last_seen = unpacked[idx]; idx += 1
+                    session_flags = unpacked[idx]; idx += 1
+                    imsi_bytes = unpacked[idx]; idx += 1
+                    imsi_len = unpacked[idx]; idx += 1
+
+                    encoded_imsi = qfi = tunnel_id = tun_ipv4_dst_int = tun_flags = direction = original_port = 0
+
+                    if len(unpacked) > idx:
+                        encoded_imsi = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        qfi = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        tunnel_id = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        tun_ipv4_dst_int = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        tun_flags = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        direction = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        original_port = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        reserved_bytes = unpacked[idx]; idx += 1
+                    if len(unpacked) > idx:
+                        metadata_mark = unpacked[idx]
+
+                    if metadata_mark is None:
+                        metadata_mark = _compute_ue_mark_from_ip_int(teid_ul_in)
+
+                    state = 'active' if (session_flags & 0x1) else 'inactive'
+
+                    return {
+                        'enb_ip': socket.inet_ntop(socket.AF_INET, struct.pack('!I', enb_ip_int)),
+                        'teid_ul_in': teid_ul_in,
+                        'teid_ul_out': teid_ul_out,
+                        'teid_dl_in': teid_dl_in,
+                        'teid_dl_out': teid_dl_out,
+                        's1u_ifindex': s1u_ifindex,
+                        'sgi_ifindex': sgi_ifindex,
+                        'ovs_ifindex': ovs_ifindex,
+                        'ul_mac_src': ul_mac_src,
+                        'ul_mac_dst': ul_mac_dst,
+                        'qos_mark': qos_mark,
+                        'bearer_id': bearer_id,
+                        'ul_bytes': ul_bytes,
+                        'dl_bytes': dl_bytes,
+                        'ul_packets': ul_packets,
+                        'dl_packets': dl_packets,
+                        'last_seen': last_seen,
+                        'session_flags': session_flags,
+                        'imsi': imsi_bytes[:imsi_len],
+                        'imsi_len': imsi_len,
+                        'encoded_imsi': encoded_imsi,
+                        'qfi': qfi,
+                        'tunnel_id': tunnel_id,
+                        'tun_ipv4_dst': socket.inet_ntop(socket.AF_INET, struct.pack('!I', tun_ipv4_dst_int)) if tun_ipv4_dst_int else None,
+                        'tun_flags': tun_flags,
+                        'direction': direction,
+                        'original_port': original_port,
+                        'metadata_mark': metadata_mark,
+                        'state': state,
+                        'created_time': int(time.time()),
+                    }
+
+                except Exception as e:
+                    LOG.error("Failed to parse session value: %s", e)
+                    return None
+
+            def get_gtp_veth_ovs_port(self) -> Optional[int]:
+                """
+                Get the dynamically detected OVS port number for gtp_veth0
+                
+                Returns:
+                    OVS port number or None if not yet detected
+                """
+                if self._ovs_port_number:
+                    return self._ovs_port_number
+                
+                # Try to detect it now if not already known
+                try:
+                    ofport = BridgeTools.get_ofport(GTP_VETH_OVS)
+                    return ofport
+                except Exception as e:
+                    LOG.warning(f"Failed to get OVS port number: {e}")
+                
                 return None
-
-            idx = 0
-            enb_ip_int = unpacked[idx]; idx += 1
-            teid_ul_in = unpacked[idx]; idx += 1
-            teid_ul_out = unpacked[idx]; idx += 1
-            teid_dl_in = unpacked[idx]; idx += 1
-            teid_dl_out = unpacked[idx]; idx += 1
-            s1u_ifindex = unpacked[idx]; idx += 1
-            sgi_ifindex = unpacked[idx]; idx += 1
-            ovs_ifindex = unpacked[idx]; idx += 1
-            ul_mac_src = unpacked[idx]; idx += 1
-            ul_mac_dst = unpacked[idx]; idx += 1
-            qos_mark = unpacked[idx]; idx += 1
-            bearer_id = unpacked[idx]; idx += 1
-            ul_bytes = unpacked[idx]; idx += 1
-            dl_bytes = unpacked[idx]; idx += 1
-            ul_packets = unpacked[idx]; idx += 1
-            dl_packets = unpacked[idx]; idx += 1
-            last_seen = unpacked[idx]; idx += 1
-            session_flags = unpacked[idx]; idx += 1
-            imsi_bytes = unpacked[idx]; idx += 1
-            imsi_len = unpacked[idx]; idx += 1
-
-            encoded_imsi = qfi = tunnel_id = tun_ipv4_dst_int = tun_flags = direction = original_port = 0
-
-            if len(unpacked) > idx:
-                encoded_imsi = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                qfi = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                tunnel_id = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                tun_ipv4_dst_int = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                tun_flags = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                direction = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                original_port = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                reserved_bytes = unpacked[idx]; idx += 1
-            if len(unpacked) > idx:
-                metadata_mark = unpacked[idx]
-
-            if metadata_mark is None:
-                metadata_mark = _compute_ue_mark_from_ip_int(teid_ul_in)
-
-            state = 'active' if (session_flags & 0x1) else 'inactive'
-
-            return {
-                'enb_ip': socket.inet_ntop(socket.AF_INET, struct.pack('!I', enb_ip_int)),
-                'teid_ul_in': teid_ul_in,
-                'teid_ul_out': teid_ul_out,
-                'teid_dl_in': teid_dl_in,
-                'teid_dl_out': teid_dl_out,
-                's1u_ifindex': s1u_ifindex,
-                'sgi_ifindex': sgi_ifindex,
-                'ovs_ifindex': ovs_ifindex,
-                'ul_mac_src': ul_mac_src,
-                'ul_mac_dst': ul_mac_dst,
-                'qos_mark': qos_mark,
-                'bearer_id': bearer_id,
-                'ul_bytes': ul_bytes,
-                'dl_bytes': dl_bytes,
-                'ul_packets': ul_packets,
-                'dl_packets': dl_packets,
-                'last_seen': last_seen,
-                'session_flags': session_flags,
-                'imsi': imsi_bytes[:imsi_len],
-                'imsi_len': imsi_len,
-                'encoded_imsi': encoded_imsi,
-                'qfi': qfi,
-                'tunnel_id': tunnel_id,
-                'tun_ipv4_dst': socket.inet_ntop(socket.AF_INET, struct.pack('!I', tun_ipv4_dst_int)) if tun_ipv4_dst_int else None,
-                'tun_flags': tun_flags,
-                'direction': direction,
-                'original_port': original_port,
-                'metadata_mark': metadata_mark,
-                'state': state,
-                'created_time': int(time.time()),
-            }
-
-        except Exception as e:
-            LOG.error("Failed to parse session value: %s", e)
-            return None
-
-    def get_gtp_veth_ovs_port(self) -> Optional[int]:
-        """
-        Get the dynamically detected OVS port number for gtp_veth0
-        
-        Returns:
-            OVS port number or None if not yet detected
-        """
-        if self._ovs_port_number:
-            return self._ovs_port_number
-        
-        # Try to detect it now if not already known
-        try:
-            ofport = BridgeTools.get_ofport(GTP_VETH_OVS)
-            return ofport
-        except Exception as e:
-            LOG.warning(f"Failed to get OVS port number: {e}")
-        
-        return None
 
 
 # Global singleton instance to prevent garbage collection

@@ -11,7 +11,7 @@
  * limitations under the License.
  *
  * Author: Nitin Rajput (coRAN LABS)
- *
+ * Updated: Micky Kumar
  * eBPF gtp_veth0 Metadata Mark Handler
  *
  * This program runs on gtp_veth0 interface to restore metadata marks
@@ -177,10 +177,9 @@ int gtp_veth0_mark_handler(struct __sk_buff* skb) {
                       ((__u32)pkt_data[ETH_HLEN + 14] << 8) |
                       (__u32)pkt_data[ETH_HLEN + 15];
 
-    __u32 restored_mark = compute_ue_mark(ue_ip_int);
-
-    session_info->metadata_mark = restored_mark;
-    skb->mark = restored_mark;
+    // Phase‑1 Fix (Finding 6): Restore metadata mark from network byte order
+__u32 restored_mark = bpf_ntohl(session_info->metadata_mark);
+skb->mark = restored_mark;
 
     bpf_trace_printk("[VETH0] Restored metadata mark: 0x%x for UE 0x%x\n",
                      restored_mark, src_ip);
