@@ -75,7 +75,7 @@ from magma.pipelined.app.ue_mac import UEMacAddressController
 from magma.pipelined.app.uplink_bridge import UplinkBridgeController
 from magma.pipelined.app.vlan_learn import VlanLearnController
 from magma.pipelined.app.ebpf_gtp_manager import EbpfGtpManagerController
-from magma.pipelined.ebpf.ebpf_manager import get_ebpf_manager
+# remove line around old ebpf that was here
 from magma.pipelined.ebpf.ebpf_gtp_manager import get_ebpf_gtp_manager
 from magma.pipelined.internal_ip_allocator import InternalIPAllocator
 from magma.pipelined.ipv6_prefix_store import InterfaceIDToPrefixMapper
@@ -543,7 +543,7 @@ class ServiceManager:
         self.session_rule_version_mapper = SessionRuleToVersionMapper()
         self.interface_to_prefix_mapper = InterfaceIDToPrefixMapper()
         self.restart_info_store = RestartInfoStore()
-        self.ebpf = get_ebpf_manager(magma_service.config)
+        # remove line around old ebpf that was here
         self.ebpf_gtp = None  # Will be set by EbpfGtpManagerController
 
         apps = self._get_static_apps()
@@ -635,7 +635,7 @@ class ServiceManager:
         contexts[
             'session_rule_version_mapper'
         ] = self.session_rule_version_mapper
-        contexts['ebpf_manager'] = self.ebpf
+        # All GTP logic must flow through ebpf_gtp_manager only.
         contexts['interface_to_prefix_mapper'] = self.interface_to_prefix_mapper
         contexts['restart_info_store'] = self.restart_info_store
         contexts['app_futures'] = {app.name: Future() for app in self._apps}
