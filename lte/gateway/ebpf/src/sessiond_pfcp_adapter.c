@@ -18,7 +18,7 @@
 
 static volatile bool exiting = false;
 static const char *SOCKET_PATH = "/var/run/magma/sessiond_pfcp.sock";
-static const char *PINNED_MAP_PATH = "/sys/fs/bpf/magma_sessions"; // expected pinned map path
+static const char *PINNED_MAP_PATH = "/sys/fs/bpf/gtp/ue_session_map"; // expected pinned map path
 
 static void sigint(int sig) { exiting = true; }
 
@@ -27,14 +27,50 @@ static void sigint(int sig) { exiting = true; }
  * This is an example layout:
  */
 typedef struct {
-    __u32 seid;      // session id
-} map_key_t;
+    __be32 ue_ip;   // UE IPv4 (network byte order)
+} ue_session_key_t;
 
 typedef struct {
-    __u32 ipv4;      // network order IPv4 addr
-    __u32 teid;      // GTP TEID
-    __u32 ifindex;   // outgoing interface index
-} map_val_t;
+    __be32 enb_ip;
+
+    __u32 teid_ul_in;
+    __u32 teid_ul_out;
+    __u32 teid_dl_in;
+    __u32 teid_dl_out;
+
+    __u32 s1u_ifindex;
+    __u32 sgi_ifindex;
+    __u32 ovs_ifindex;
+
+    __u8  ul_mac_src[6];
+    __u8  ul_mac_dst[6];
+
+    __u32 qos_mark;
+    __u32 bearer_id;
+
+    __u64 ul_bytes;
+    __u64 dl_bytes;
+    __u64 ul_packets;
+    __u64 dl_packets;
+
+    __u64 last_seen;
+    __u32 session_flags;
+
+    __u8  imsi[16];
+    __u32 imsi_len;
+    __u64 encoded_imsi;
+
+    __u8  qfi;
+    __u32 tunnel_id;
+    __be32 tun_ipv4_dst;
+
+    __u8  tun_flags;
+    __u8  direction;
+    __u32 original_port;
+    __u8  reserved[3];
+
+    __u32 metadata_mark;
+} ue_session_info_t;
 
 /* Helper: open pinned map */
 static int open_pinned_map(const char *path) {
@@ -54,27 +90,40 @@ static int parse_ipv4(const char *s, __u32 *out) {
 }
 
 /* Update session map */
-static int session_map_add(int map_fd, __u32 seid, const char *ipv4_s, __u32 teid, const char *ifname) {
-    map_key_t key = { .seid = seid };
-    map_val_t val;
-    memset(&val, 0, sizeof(val));
+static int session_map_add(
+    int map_fd,
+    const char *ue_ip_str,
+    const char *enb_ip_str,
+    __u32 teid_ul_in,
+    __u32 teid_dl_out,
+    const char *ifname
+) {
+    ue_session_key_t key = {};
+    ue_session_info_t val = {};
 
-    if (parse_ipv4(ipv4_s, &val.ipv4) != 0) {
-        fprintf(stderr, "Invalid IPv4: %s\n", ipv4_s);
+    if (parse_ipv4(ue_ip_str, &key.ue_ip) != 0)
         return -1;
-    }
-    val.teid = teid;
+
+    if (parse_ipv4(enb_ip_str, &val.enb_ip) != 0)
+        return -1;
+
+    val.teid_ul_in = teid_ul_in;
+    val.teid_dl_out = teid_dl_out;
+
     int ifidx = bpf_utils_ifindex(ifname);
-    if (ifidx <= 0) {
-        fprintf(stderr, "Invalid interface: %s\n", ifname);
+    if (ifidx <= 0)
         return -1;
-    }
-    val.ifindex = (__u32)ifidx;
+
+    val.s1u_ifindex = ifidx;
+    val.ovs_ifindex = ifidx;
+
+    val.session_flags = 1;  // ACTIVE
 
     if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY) != 0) {
-        fprintf(stderr, "bpf_map_update_elem failed: %s\n", strerror(errno));
+        perror("bpf_map_update_elem");
         return -1;
     }
+
     return 0;
 }
 
@@ -146,7 +195,7 @@ int main(int argc, char **argv) {
         buf[n] = '\0';
 
         /* Expect commands of the form:
-         *   ADD <seid> <ipv4> <teid> <ifname>\n
+         *   ADD <ue_ip> <enb_ip> <teid_ul> <teid_dl> <ifname>\n
          *   DEL <seid>\n
          */
         char *save = NULL;

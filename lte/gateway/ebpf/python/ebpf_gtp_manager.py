@@ -1,95 +1,133 @@
-
-
+import socket
+import struct
 import logging
-import time
-from ebpf_utils import read_bpf_map, write_bpf_map, delete_bpf_map_entry
+from typing import Optional
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s'
-)
+from ebpf_utils import write_bpf_map, delete_bpf_map_entry
 
-class GtpSession:
-    """Represents a GTP session entry"""
-    def __init__(self, imsi, teid, ue_ip, state):
-        self.imsi = imsi
-        self.teid = teid
-        self.ue_ip = ue_ip
-        self.state = state
-
-    def __repr__(self):
-        return f"GtpSession(imsi={self.imsi}, teid={self.teid}, ue_ip={self.ue_ip}, state={self.state})"
+LOG = logging.getLogger(__name__)
 
 
-def get_kernel_gtp_sessions(map_name="/sys/fs/bpf/gtp_session_map"):
+class EbpfGtpManager:
     """
-    Read GTP sessions from pinned BPF map in kernel
-    Returns: list of GtpSession
+    Userspace manager for GTP eBPF datapath.
+
+    Owns lifecycle of UE sessions stored in ue_session_map.
     """
-    sessions = []
-    kernel_entries = read_bpf_map(map_name)
-    for entry in kernel_entries:
-        # Example entry: {'imsi': '001010123456789', 'teid': 12345, 'ue_ip': '10.0.0.5', 'state': 1}
-        session = GtpSession(
-            imsi=entry['imsi'],
-            teid=entry['teid'],
-            ue_ip=entry['ue_ip'],
-            state=entry['state']
+
+    def __init__(self, ue_session_map):
+        """
+        ue_session_map: handle or fd passed from loader (bcc/libbpf)
+        """
+        self.ue_session_map = ue_session_map
+
+    # ------------------------------------------------------------------
+    # ADD
+    # ------------------------------------------------------------------
+    def add_ue_session(
+        self,
+        ue_ip: str,
+        enb_ip: str,
+        teid_ul_in: int,
+        teid_ul_out: int,
+        teid_dl_in: int,
+        teid_dl_out: int,
+        s1u_ifindex: int,
+        sgi_ifindex: int,
+        ovs_ifindex: int,
+        ul_mac_src: bytes,
+        ul_mac_dst: bytes,
+        qfi: int = 0,
+        active: bool = True,
+    ) -> None:
+        """
+        Create or update a UE session in ue_session_map.
+        """
+
+        # ---- key (struct ue_session_key { __be32 ue_ip; }) ----
+        ue_ip_be = struct.unpack("!I", socket.inet_aton(ue_ip))[0]
+        key = struct.pack("!I", ue_ip_be)
+
+        session_flags = 1 if active else 0
+
+        # ---- value (struct ue_session_info) ----
+        value = struct.pack(
+            # enb_ip
+            "!I"
+            # teid_ul_in, teid_ul_out, teid_dl_in, teid_dl_out
+            "IIII"
+            # s1u_ifindex, sgi_ifindex, ovs_ifindex
+            "III"
+            # ul_mac_src, ul_mac_dst
+            "6s6s"
+            # qos_mark, bearer_id
+            "II"
+            # ul_bytes, dl_bytes, ul_packets, dl_packets
+            "QQQQ"
+            # last_seen, session_flags
+            "QI"
+            # imsi[16], imsi_len
+            "16sI"
+            # encoded_imsi
+            "Q"
+            # qfi
+            "B"
+            # tunnel_id
+            "I"
+            # tun_ipv4_dst
+            "I"
+            # tun_flags
+            "B"
+            # direction
+            "B"
+            # original_port
+            "I"
+            # reserved[3]
+            "3s"
+            # metadata_mark (network order, set later by decap)
+            "I",
+            # ---- values ----
+            struct.unpack("!I", socket.inet_aton(enb_ip))[0],
+            teid_ul_in,
+            teid_ul_out,
+            teid_dl_in,
+            teid_dl_out,
+            s1u_ifindex,
+            sgi_ifindex,
+            ovs_ifindex,
+            ul_mac_src,
+            ul_mac_dst,
+            0,                  # qos_mark
+            0,                  # bearer_id
+            0, 0, 0, 0,          # counters
+            0,                  # last_seen
+            session_flags,       # session_flags
+            b"",                 # imsi
+            0,                  # imsi_len
+            0,                  # encoded_imsi
+            qfi,                # qfi
+            0,                  # tunnel_id
+            0,                  # tun_ipv4_dst
+            0,                  # tun_flags
+            0,                  # direction
+            0,                  # original_port
+            b"\x00\x00\x00",
+            0,                  # metadata_mark (filled by gtp_decap)
         )
-        sessions.append(session)
-    return sessions
 
+        LOG.info("Adding UE session for %s", ue_ip)
+        write_bpf_map(self.ue_session_map, key, value)
 
-def sync_gtp_sessions():
-    """
-    Synchronize GTP sessions between kernel BPF map and PipelineD userspace
-    """
-    logging.info("Syncing GTP sessions")
-    kernel_sessions = get_kernel_gtp_sessions()
+    # ------------------------------------------------------------------
+    # REMOVE
+    # ------------------------------------------------------------------
+    def remove_ue_session(self, ue_ip: str) -> None:
+        """
+        Remove a UE session from ue_session_map.
+        """
 
-    # Placeholder: get userspace sessions (from DB or PipelineD)
-    userspace_sessions = get_userspace_sessions()
+        ue_ip_be = struct.unpack("!I", socket.inet_aton(ue_ip))[0]
+        key = struct.pack("!I", ue_ip_be)
 
-    # Sync kernel -> userspace
-    for ksession in kernel_sessions:
-        if ksession.imsi not in userspace_sessions:
-            logging.info("Adding new session to userspace: %s", ksession)
-            add_userspace_session(ksession)
-        else:
-            # Optional: update state if changed
-            pass
-
-    # Sync userspace -> kernel (remove stale entries)
-    kernel_imsi_set = {s.imsi for s in kernel_sessions}
-    for usession in userspace_sessions.values():
-        if usession.imsi not in kernel_imsi_set:
-            logging.info("Removing stale kernel session: %s", usession)
-            delete_bpf_map_entry("/sys/fs/bpf/gtp_session_map", usession.teid)
-
-
-def get_userspace_sessions():
-    """
-    Retrieve GTP sessions from userspace database / PipelineD
-    Returns: dict of imsi -> GtpSession
-    """
-    # Placeholder for real DB/API call
-    return {}
-
-
-def add_userspace_session(session: GtpSession):
-    """
-    Add a new session to userspace
-    """
-    # Placeholder for real DB/API call
-    logging.info("Session added to userspace: %s", session)
-
-
-if __name__ == "__main__":
-    while True:
-        try:
-            sync_gtp_sessions()
-            time.sleep(10)  # configurable
-        except KeyboardInterrupt:
-            logging.info("GTP session manager stopped")
-            break
+        LOG.info("Removing UE session for %s", ue_ip)
+        delete_bpf_map_entry(self.ue_session_map, key)

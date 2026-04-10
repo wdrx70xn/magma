@@ -49,13 +49,28 @@ def read_bpf_map(map_path: str):
         return []
 
 
-def write_bpf_map(map_path: str, key: str, value: dict):
+def write_bpf_map(map_path: str, key: bytes, value: bytes):
     """
-    Write an entry to a BPF map
+    Write or update an entry in a pinned BPF map using bpftool.
+
+    key   : raw bytes (already packed)
+    value : raw bytes (already packed)
     """
-    # This is a placeholder; in practice, use bpftool or libbpf APIs
-    logging.info("Writing to BPF map %s: %s -> %s", map_path, key, value)
-    # TODO: Implement actual write logic
+    if not os.path.exists(map_path):
+        raise FileNotFoundError(f"BPF map not found: {map_path}")
+
+    # Convert bytes to hex format expected by bpftool
+    key_hex = " ".join(f"{b:02x}" for b in key)
+    value_hex = " ".join(f"{b:02x}" for b in value)
+
+    cmd = (
+        f"bpftool map update pinned {map_path} "
+        f"key hex {key_hex} "
+        f"value hex {value_hex}"
+    )
+
+    logging.debug("Executing: %s", cmd)
+    run_command(cmd)
 
 
 def delete_bpf_map_entry(map_path: str, key: str):

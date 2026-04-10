@@ -16,6 +16,10 @@ import logging
 import threading
 import time
 
+import socket
+
+PFCP_SOCKET = "/var/run/magma/sessiond_pfcp.sock"
+
 from ebpf_utils import (
     load_bpf_map,
     bpf_map_update,
@@ -23,7 +27,7 @@ from ebpf_utils import (
     map_key_ipv4,
 )
 
-SESSION_MAP = "/sys/fs/bpf/magma/session_map"
+SESSION_MAP = "/sys/fs/bpf/gtp/ue_session_map"
 QOS_MAP = "/sys/fs/bpf/magma/qos_map"
 STATS_MAP = "/sys/fs/bpf/magma/stats_map"
 
@@ -74,6 +78,17 @@ class EBPFSessiondIntegration:
         }
         """
 
+        cmd = (
+                f"ADD {session['ue_ipv4']} "
+                f"{session['enb_ip']} "
+                f"{session['teid_ul']} "
+                f"{session['teid_dl']} "
+                f"{session['ifname']}\n"
+            )
+            resp = self.send_pfcp_cmd(cmd)
+            logging.info("[PFCP] %s", resp.strip())
+
+
         ue_key = map_key_ipv4(session["ue_ipv4"])
 
         session_val = {
@@ -86,7 +101,7 @@ class EBPFSessiondIntegration:
 
         logging.info(f"[SessionD] Installing session for {session['ue_ipv4']}")
 
-        bpf_map_update(self.session_map, ue_key, session_val)
+    
 
         # QoS map entry
         qos_val = {
@@ -103,10 +118,13 @@ class EBPFSessiondIntegration:
         """Remove a user session from BPF maps."""
         ue_key = map_key_ipv4(ue_ipv4)
 
+        cmd = f"DEL {ue_ipv4}\n"
+        resp = self.send_pfcp_cmd(cmd)
+
+
         logging.info(f"[SessionD] Removing session for {ue_ipv4}")
 
-        bpf_map_delete(self.session_map, ue_key)
-        bpf_map_delete(self.qos_map, ue_key)
+
 
         logging.info("[SessionD] Session removed.")
 
@@ -148,7 +166,7 @@ class EBPFSessiondIntegration:
     # ------------------------------------------------------------
     # Background Daemon Loop (optional)
     # ------------------------------------------------------------
-    def start_event_listener(self, json_events_path="/var/run/magma/sessiond_events.json"):
+    def start_event_listener(self, json_events_path="/var/run/magma/sessiond_pfcp.sock"):
         """
         Simple file-based watcher for new events.
         Real version should use gRPC from SessionD.
@@ -196,4 +214,8 @@ class EBPFSessiondIntegration:
             self.update_qos(evt["ue_ipv4"], evt["qos"])
         else:
             logging.warning(f"[SessionD] Unknown event type: {etype}")
-
+    def send_pfcp_cmd(self, cmd: str):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(PFCP_SOCKET)
+        s.sendall(cmd.encode())
+        return s.recv(256).decode()
